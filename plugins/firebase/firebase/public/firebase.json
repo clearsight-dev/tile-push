@@ -1,7 +1,10 @@
 {
-  "firestore": {
-    "indexes": "firestore.indexes.json"
-  },
+  "firestore": [
+    {
+      "database": "tile-push",
+      "indexes": "firestore.indexes.json"
+    }
+  ],
   "functions": {
     "source": "functions",
     "codebase": "default",

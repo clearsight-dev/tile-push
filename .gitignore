@@ -52,6 +52,13 @@ npm-debug.log
 yarn-debug.log
 yarn-error.log
 
+# tile-push fork: assembled deploy artifacts (regenerated each build)
+plugins/firebase/deploy/
+service-account.json
+.env.hotupdater
+.env.firebase
+.firebase/
+
 # BUCK
 buck-out/
 \.buckd/

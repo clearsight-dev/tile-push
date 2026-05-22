@@ -158,6 +158,11 @@ export interface Bundle {
    * decisions only.
    */
   targetCohorts?: string[] | null;
+  /**
+   * Tenant/app identifier for multi-tenant deployments.
+   * Optional; queries do NOT filter by this yet.
+   */
+  appId?: string;
 }
 
 type SnakeCase<S extends string> = S extends `${infer T}${infer U}`

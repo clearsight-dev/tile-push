@@ -6,16 +6,17 @@ import { Hono } from "hono";
 import { firebaseDatabase } from "../../src/firebaseDatabase";
 import { firebaseFunctionsStorage } from "../../src/firebaseFunctionsStorage";
 
-declare global {
-  var HotUpdater: {
-    REGION: string;
-  };
-}
+// Hardcoded region for tile-push SaaS deployment.
+// Original hot-updater used a HotUpdater.REGION build-time substitution
+// via the CLI's transformEnv helper; we bypass that by pinning here.
+const REGION = "us-central1";
 
 export const HOT_UPDATER_BASE_PATH = "/api/check-update";
 
 if (!admin.apps.length) {
-  admin.initializeApp();
+  admin.initializeApp({
+    storageBucket: "tile-push-bundles",
+  });
 }
 
 const adminOptions = admin.app().options;
@@ -54,7 +55,7 @@ app.mount(HOT_UPDATER_BASE_PATH, hotUpdater.handler);
 
 const handler = onRequest(
   {
-    region: HotUpdater.REGION,
+    region: REGION,
   },
   async (req, res) => {
     const host = req.hostname;
@@ -76,7 +77,7 @@ const handler = onRequest(
 );
 
 // Firebase encodes hyphenated function names as nested entry points,
-// e.g. "hot-updater" -> "hot.updater".
-export const hot = {
-  updater: handler,
+// e.g. "tile-push" -> "tile.push".
+export const tile = {
+  push: handler,
 };

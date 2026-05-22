@@ -24,6 +24,8 @@ export default defineConfig([
         "@hot-updater/js",
         "@hot-updater/plugin-core",
         "@hot-updater/server",
+        "@hot-updater/server/runtime",
+        "hono",
       ],
     },
     failOnWarn: true,

@@ -22,6 +22,7 @@ import {
   createDatabasePluginGetUpdateInfo,
 } from "@hot-updater/plugin-core";
 import admin from "firebase-admin";
+import { getFirestore } from "firebase-admin/firestore";
 
 type FirestoreData = admin.firestore.DocumentData;
 
@@ -214,7 +215,7 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
       app = admin.initializeApp(config);
     }
 
-    const db = admin.firestore(app);
+    const db = getFirestore(app, "tile-push");
     const bundlesCollection = db.collection("bundles");
     const targetAppVersionsCollection = db.collection("target_app_versions");
 
