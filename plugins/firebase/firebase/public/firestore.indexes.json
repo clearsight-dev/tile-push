@@ -4,6 +4,7 @@
       "collectionGroup": "bundles",
       "queryScope": "COLLECTION",
       "fields": [
+        { "fieldPath": "app_id", "order": "ASCENDING" },
         { "fieldPath": "channel", "order": "ASCENDING" },
         { "fieldPath": "enabled", "order": "ASCENDING" },
         { "fieldPath": "platform", "order": "ASCENDING" },
@@ -15,6 +16,7 @@
       "collectionGroup": "bundles",
       "queryScope": "COLLECTION",
       "fields": [
+        { "fieldPath": "app_id", "order": "ASCENDING" },
         { "fieldPath": "channel", "order": "ASCENDING" },
         { "fieldPath": "platform", "order": "ASCENDING" },
         { "fieldPath": "enabled", "order": "ASCENDING" },
@@ -26,6 +28,7 @@
       "collectionGroup": "bundles",
       "queryScope": "COLLECTION",
       "fields": [
+        { "fieldPath": "app_id", "order": "ASCENDING" },
         { "fieldPath": "channel", "order": "ASCENDING" },
         { "fieldPath": "platform", "order": "ASCENDING" },
         { "fieldPath": "id", "order": "DESCENDING" }
@@ -35,6 +38,7 @@
       "collectionGroup": "bundles",
       "queryScope": "COLLECTION",
       "fields": [
+        { "fieldPath": "app_id", "order": "ASCENDING" },
         { "fieldPath": "channel", "order": "ASCENDING" },
         { "fieldPath": "id", "order": "DESCENDING" }
       ]
@@ -43,6 +47,7 @@
       "collectionGroup": "bundles",
       "queryScope": "COLLECTION",
       "fields": [
+        { "fieldPath": "app_id", "order": "ASCENDING" },
         { "fieldPath": "platform", "order": "ASCENDING" },
         { "fieldPath": "id", "order": "DESCENDING" }
       ]
@@ -51,6 +56,7 @@
       "collectionGroup": "bundles",
       "queryScope": "COLLECTION",
       "fields": [
+        { "fieldPath": "app_id", "order": "ASCENDING" },
         { "fieldPath": "channel", "order": "ASCENDING" },
         { "fieldPath": "enabled", "order": "ASCENDING" },
         { "fieldPath": "platform", "order": "ASCENDING" },
@@ -62,11 +68,21 @@
       "collectionGroup": "bundles",
       "queryScope": "COLLECTION",
       "fields": [
+        { "fieldPath": "app_id", "order": "ASCENDING" },
         { "fieldPath": "channel", "order": "ASCENDING" },
         { "fieldPath": "enabled", "order": "ASCENDING" },
         { "fieldPath": "fingerprint_hash", "order": "ASCENDING" },
         { "fieldPath": "platform", "order": "ASCENDING" },
         { "fieldPath": "id", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "target_app_versions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "app_id", "order": "ASCENDING" },
+        { "fieldPath": "platform", "order": "ASCENDING" },
+        { "fieldPath": "channel", "order": "ASCENDING" }
       ]
     }
   ],

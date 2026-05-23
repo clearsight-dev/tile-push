@@ -9,12 +9,30 @@ import {
 } from "@hot-updater/plugin-core";
 import admin from "firebase-admin";
 
+import { currentAppId } from "./tenantContext";
+
 export interface FirebaseStorageConfig extends admin.AppOptions {
   storageBucket: string;
   /**
    * Base path where bundles will be stored in the bucket
    */
   basePath?: string;
+  /**
+   * If set, getDownloadUrl returns `${cdnUrl}/${key}` instead of a signed URL.
+   * Requires the bucket (or the CDN) to serve the object publicly. Skipping
+   * signBlob removes a ~600ms IAM round-trip per check-update and removes the
+   * concurrency bottleneck that serializes signing calls.
+   */
+  cdnUrl?: string;
+  /**
+   * Tenant scope. Used by upload() to prefix storage keys with t/{appId}/.
+   * Resolved as: ALS context > this field > throw.
+   *
+   * For CLI use (single tenant per config), set this field in
+   * hot-updater.config.ts. For multi-tenant runtime, leave undefined — the
+   * tenantALS context (set by the Cloud Function middleware) supplies appId.
+   */
+  appId?: string;
 }
 
 export const firebaseStorage =
@@ -30,7 +48,18 @@ export const firebaseStorage =
       }
       const bucket = app.storage().bucket(config.storageBucket);
 
-      const getStorageKey = createStorageKeyBuilder(config.basePath);
+      // Compose tenant prefix into the storage key builder. The tenant
+      // segment (t/{appId}) goes BEFORE any user-provided basePath, so
+      // every bundle's storage path is unambiguously tenant-scoped:
+      //   t/{appId}/{basePath?}/{bundleId}/bundle.zip
+      const resolveStorageKeyBuilder = () => {
+        const appId = currentAppId(config.appId);
+        const tenantSegment = `t/${appId}`;
+        const combined = config.basePath
+          ? `${tenantSegment}/${config.basePath}`
+          : tenantSegment;
+        return createStorageKeyBuilder(combined);
+      };
 
       return {
         node: {
@@ -59,7 +88,9 @@ export const firebaseStorage =
               const fileContent = await fs.readFile(filePath);
               const contentType = getContentType(filePath);
               const filename = path.basename(filePath);
-              const storageKey = getStorageKey(key, filename);
+              // Tenant-scoped key. Resolved per-upload because ALS context
+              // could differ between calls (multi-tenant CLI use case).
+              const storageKey = resolveStorageKeyBuilder()(key, filename);
 
               const file = bucket.file(storageKey);
               await file.save(fileContent, {
@@ -146,6 +177,10 @@ export const firebaseStorage =
             const key = u.pathname.slice(1);
             if (!key) {
               throw new Error("Invalid Firebase storage URI: missing key");
+            }
+            if (config.cdnUrl) {
+              const base = config.cdnUrl.replace(/\/+$/, "");
+              return { fileUrl: `${base}/${key}` };
             }
             const file = bucket.file(key);
             const [signedUrl] = await file.getSignedUrl({

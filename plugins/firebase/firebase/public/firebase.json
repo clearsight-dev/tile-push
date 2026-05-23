@@ -16,5 +16,39 @@
       "*.local"
     ],
     "gen": 2
+  },
+  "hosting": {
+    "public": "hosting",
+    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+    "rewrites": [
+      {
+        "source": "/api/**",
+        "function": {
+          "functionId": "tile-push",
+          "region": "us-central1",
+          "pinTag": true
+        }
+      }
+    ],
+    "headers": [
+      {
+        "source": "/api/check-update/v2/**",
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=60, s-maxage=60"
+          }
+        ]
+      },
+      {
+        "source": "/api/check-update/!(v2)/**",
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "no-store"
+          }
+        ]
+      }
+    ]
   }
 }

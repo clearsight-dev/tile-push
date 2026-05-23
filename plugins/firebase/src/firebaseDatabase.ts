@@ -24,13 +24,50 @@ import {
 import admin from "firebase-admin";
 import { getFirestore } from "firebase-admin/firestore";
 
+import { currentAppId } from "./tenantContext";
+
 type FirestoreData = admin.firestore.DocumentData;
 
+// -----------------------------------------------------------------------------
+// Tenant-aware internal types
+// -----------------------------------------------------------------------------
+//
+// Bundle (upstream type) has `appId?: string` — optional, because we can't
+// break upstream callers. But INSIDE this plugin, every bundle is tenant-
+// scoped. These tightened types make the invariant explicit:
+//   - TenantBundle: a Bundle that definitely has appId set
+//   - TenantSnakeCaseBundle: same, but matches Firestore document shape
+//   - TenantQueryWhere: a where clause that has app_id pinned to a value
+//
+// The plugin uses these internally; callers pass the upstream types and the
+// plugin lifts them into the tenant-required shape via currentAppId().
+//
+// If you add a new method, you'll get a TypeScript error if you try to write
+// a bundle without appId or filter without app_id. That's the enforcement.
+// -----------------------------------------------------------------------------
+
+type TenantBundle = Bundle & { appId: string };
+type TenantSnakeCaseBundle = SnakeCaseBundle & { app_id: string };
+type TenantQueryWhere = DatabaseBundleQueryWhere & { appId: string };
+
+// Plugin config = Firebase admin options PLUS an optional appId fallback for
+// CLI / script callers that don't have an HTTP-derived ALS context.
+export interface FirebaseDatabaseConfig extends admin.AppOptions {
+  /**
+   * Default tenant scope. Used as a fallback when no ALS context is present
+   * (e.g. CLI deploy from hot-updater.config.ts). HTTP requests get appId
+   * from the `/t/{appId}/` URL segment, which always wins over this.
+   */
+  appId?: string;
+}
+
 const bundleMatchesQueryWhere = (
-  bundle: Bundle,
-  where: DatabaseBundleQueryWhere | undefined,
+  bundle: TenantBundle,
+  where: TenantQueryWhere,
 ) => {
-  if (!where) return true;
+  // Tenant invariant: any bundle reaching this helper is already scoped
+  // by appId via the Firestore query. Re-check defensively.
+  if (bundle.appId !== where.appId) return false;
   if (where.channel !== undefined && bundle.channel !== where.channel)
     return false;
   if (where.platform !== undefined && bundle.platform !== where.platform)
@@ -84,9 +121,13 @@ const sortBundles = (
 
 const applyFirestoreQueryableFilters = (
   query: admin.firestore.Query<FirestoreData>,
-  where: DatabaseBundleQueryWhere | undefined,
+  where: TenantQueryWhere,
 ) => {
-  let nextQuery = query;
+  // TENANT GUARD: every Firestore query MUST begin with an app_id filter.
+  // This is the single chokepoint that enforces tenant isolation at the
+  // database query layer. Composite indexes are (app_id, ...rest) so this
+  // filter is the discriminator that selects only the tenant's slice.
+  let nextQuery = query.where("app_id", "==", where.appId);
 
   if (where?.channel) {
     nextQuery = nextQuery.where("channel", "==", where.channel);
@@ -155,7 +196,28 @@ const chunkValues = <T>(values: T[], size: number) => {
   return chunks;
 };
 
-const convertToBundle = (firestoreData: SnakeCaseBundle): Bundle => {
+const convertToBundle = (
+  firestoreData: SnakeCaseBundle & { app_id?: string },
+  expectedAppId: string,
+): TenantBundle => {
+  // Defense-in-depth: if a bundle document somehow lacks app_id, or has a
+  // mismatched app_id, refuse to return it. This protects against bugs
+  // (forgot to write app_id during a deploy) and against corruption /
+  // mistaken cross-tenant writes.
+  const docAppId = firestoreData.app_id;
+  if (!docAppId) {
+    throw new Error(
+      `Bundle ${firestoreData.id} has no app_id — corrupt/legacy data, refusing to serve.`,
+    );
+  }
+  if (docAppId !== expectedAppId) {
+    throw new Error(
+      `Tenant mismatch: bundle ${firestoreData.id} belongs to ${docAppId}, ` +
+        `but request was scoped to ${expectedAppId}. Possible cache poisoning ` +
+        `or index leak — investigate.`,
+    );
+  }
+
   const rawMetadata = firestoreData.metadata;
   const storedPatches = (
     firestoreData as SnakeCaseBundle & {
@@ -175,6 +237,7 @@ const convertToBundle = (firestoreData: SnakeCaseBundle): Bundle => {
   const primaryPatch = patches[0] ?? null;
 
   return {
+    appId: docAppId,
     channel: firestoreData.channel,
     enabled: Boolean(firestoreData.enabled),
     shouldForceUpdate: Boolean(firestoreData.should_force_update),
@@ -205,7 +268,7 @@ const convertToBundle = (firestoreData: SnakeCaseBundle): Bundle => {
   };
 };
 
-export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
+export const firebaseDatabase = createDatabasePlugin<FirebaseDatabaseConfig>({
   name: "firebaseDatabase",
   factory: (config) => {
     let app: admin.app.App;
@@ -219,10 +282,16 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
     const bundlesCollection = db.collection("bundles");
     const targetAppVersionsCollection = db.collection("target_app_versions");
 
+    // CLI/script fallback. Runtime HTTP requests override this via ALS.
+    const configAppId = config.appId;
+
     return {
       getUpdateInfo: createDatabasePluginGetUpdateInfo({
         async listTargetAppVersions({ platform, channel }) {
+          // TENANT GUARD: every query scopes to the current tenant.
+          const appId = currentAppId(configAppId);
           const querySnapshot = await targetAppVersionsCollection
+            .where("app_id", "==", appId)
             .where("platform", "==", platform)
             .where("channel", "==", channel)
             .select("target_app_version")
@@ -243,9 +312,11 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
           { platform, channel, minBundleId },
           targetAppVersions,
         ) {
+          const appId = currentAppId(configAppId);
           const results = await Promise.all(
             chunkValues(targetAppVersions, 10).map((versions) =>
               bundlesCollection
+                .where("app_id", "==", appId)
                 .where("platform", "==", platform)
                 .where("channel", "==", channel)
                 .where("enabled", "==", true)
@@ -257,7 +328,10 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
 
           return results.flatMap((snapshot) =>
             snapshot.docs.map((doc) =>
-              convertToBundle(doc.data() as SnakeCaseBundle),
+              convertToBundle(
+                doc.data() as SnakeCaseBundle & { app_id?: string },
+                appId,
+              ),
             ),
           );
         },
@@ -268,7 +342,9 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
           minBundleId,
           fingerprintHash,
         }) {
+          const appId = currentAppId(configAppId);
           const querySnapshot = await bundlesCollection
+            .where("app_id", "==", appId)
             .where("platform", "==", platform)
             .where("channel", "==", channel)
             .where("enabled", "==", true)
@@ -277,12 +353,16 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
             .get();
 
           return querySnapshot.docs.map((doc) =>
-            convertToBundle(doc.data() as SnakeCaseBundle),
+            convertToBundle(
+              doc.data() as SnakeCaseBundle & { app_id?: string },
+              appId,
+            ),
           );
         },
       }),
 
       async getBundleById(bundleId) {
+        const appId = currentAppId(configAppId);
         const bundleRef = bundlesCollection.doc(bundleId);
         const bundleSnap = await bundleRef.get();
 
@@ -290,18 +370,33 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
           return null;
         }
 
-        const firestoreData = bundleSnap.data() as SnakeCaseBundle;
-        return convertToBundle(firestoreData);
+        const firestoreData = bundleSnap.data() as SnakeCaseBundle & {
+          app_id?: string;
+        };
+        // convertToBundle enforces app_id matches `appId` — returns null
+        // if there's a mismatch (we don't want to leak existence).
+        try {
+          return convertToBundle(firestoreData, appId);
+        } catch {
+          return null;
+        }
       },
 
       async getBundles(options) {
+        const appId = currentAppId(configAppId);
         const { where, limit, orderBy } = options;
         const offset =
           (("offset" in options ? options.offset : undefined) as
             | number
             | undefined) ?? 0;
 
-        let query = applyFirestoreQueryableFilters(bundlesCollection, where);
+        // Lift user-provided where into a tenant-scoped where.
+        const tenantWhere: TenantQueryWhere = { ...(where ?? {}), appId };
+
+        let query = applyFirestoreQueryableFilters(
+          bundlesCollection,
+          tenantWhere,
+        );
 
         query = query.orderBy(
           "id",
@@ -312,8 +407,15 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
           const querySnapshot = await query.get();
           const filteredBundles = sortBundles(
             querySnapshot.docs
-              .map((doc) => convertToBundle(doc.data() as SnakeCaseBundle))
-              .filter((bundle) => bundleMatchesQueryWhere(bundle, where)),
+              .map((doc) =>
+                convertToBundle(
+                  doc.data() as SnakeCaseBundle & { app_id?: string },
+                  appId,
+                ),
+              )
+              .filter((bundle) =>
+                bundleMatchesQueryWhere(bundle, tenantWhere),
+              ),
             orderBy,
           );
           const total = filteredBundles.length;
@@ -342,7 +444,10 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
 
         const data = sortBundles(
           querySnapshot.docs.map((doc) =>
-            convertToBundle(doc.data() as SnakeCaseBundle),
+            convertToBundle(
+              doc.data() as SnakeCaseBundle & { app_id?: string },
+              appId,
+            ),
           ),
           orderBy,
         );
@@ -357,8 +462,11 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
       },
 
       async getChannels() {
+        const appId = currentAppId(configAppId);
         const channelsCollection = db.collection("channels");
-        const querySnapshot = await channelsCollection.get();
+        const querySnapshot = await channelsCollection
+          .where("app_id", "==", appId)
+          .get();
 
         if (querySnapshot.empty) {
           return [];
@@ -380,15 +488,23 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
           return;
         }
 
+        // TENANT GUARD: pin the current tenant for the entire transaction.
+        // All reads and writes are scoped to this appId.
+        const appId = currentAppId(configAppId);
+
         let isTargetAppVersionChanged = false;
 
         await db.runTransaction(async (transaction) => {
-          const bundlesSnapshot = await transaction.get(bundlesCollection);
+          // Read only THIS tenant's data. Composite indexes are
+          // (app_id, ...) so each tenant scans only their own slice.
+          const bundlesSnapshot = await transaction.get(
+            bundlesCollection.where("app_id", "==", appId),
+          );
           const targetVersionsSnapshot = await transaction.get(
-            db.collection("target_app_versions"),
+            db.collection("target_app_versions").where("app_id", "==", appId),
           );
           const channelsSnapshot = await transaction.get(
-            db.collection("channels"),
+            db.collection("channels").where("app_id", "==", appId),
           );
 
           const bundlesMap: { [id: string]: any } = {};
@@ -396,7 +512,7 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
             bundlesMap[doc.id] = doc.data();
           }
 
-          // Process all operations
+          // Process all operations (in-memory state for orphan calc).
           for (const { operation, data } of changedSets) {
             if (data.targetAppVersion) {
               isTargetAppVersionChanged = true;
@@ -405,6 +521,7 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
             if (operation === "insert" || operation === "update") {
               bundlesMap[data.id] = {
                 id: data.id,
+                app_id: appId,
                 channel: data.channel,
                 enabled: data.enabled,
                 should_force_update: data.shouldForceUpdate,
@@ -427,41 +544,43 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
                 rollout_cohort_count:
                   data.rolloutCohortCount ?? DEFAULT_ROLLOUT_COHORT_COUNT,
                 target_cohorts: data.targetCohorts ?? null,
-              } as SnakeCaseBundle;
+              } as TenantSnakeCaseBundle;
 
-              // Add channel to channels collection
-              const channelRef = db.collection("channels").doc(data.channel);
+              // Add channel to channels collection (tenant-scoped doc id).
+              const channelDocId = `${appId}_${data.channel}`;
+              const channelRef = db.collection("channels").doc(channelDocId);
               transaction.set(
                 channelRef,
                 {
+                  app_id: appId,
                   name: data.channel,
                 },
                 { merge: true },
               );
             } else if (operation === "delete") {
-              // Check if bundle exists
               if (!bundlesMap[data.id]) {
-                throw new Error(`Bundle with id ${data.id} not found`);
+                throw new Error(
+                  `Bundle ${data.id} not found in tenant ${appId} — refusing to delete.`,
+                );
               }
-
-              // Remove from bundlesMap
               delete bundlesMap[data.id];
               isTargetAppVersionChanged = true;
             }
           }
 
-          // Calculate required target app versions and channels from remaining bundles
+          // Calculate required target app versions and channels from
+          // remaining (tenant-scoped) bundles.
           const requiredTargetVersionKeys = new Set<string>();
           const requiredChannels = new Set<string>();
           for (const bundle of Object.values(bundlesMap)) {
             if (bundle.target_app_version) {
-              const key = `${bundle.platform}_${bundle.channel}_${bundle.target_app_version}`;
+              const key = `${appId}_${bundle.platform}_${bundle.channel}_${bundle.target_app_version}`;
               requiredTargetVersionKeys.add(key);
             }
-            requiredChannels.add(bundle.channel);
+            requiredChannels.add(`${appId}_${bundle.channel}`);
           }
 
-          // Execute database operations
+          // Execute Firestore writes.
           for (const { operation, data } of changedSets) {
             const bundleRef = bundlesCollection.doc(data.id);
 
@@ -470,6 +589,7 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
                 bundleRef,
                 {
                   id: data.id,
+                  app_id: appId,
                   channel: data.channel,
                   enabled: data.enabled,
                   should_force_update: data.shouldForceUpdate,
@@ -492,18 +612,20 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
                   rollout_cohort_count:
                     data.rolloutCohortCount ?? DEFAULT_ROLLOUT_COHORT_COUNT,
                   target_cohorts: data.targetCohorts ?? null,
-                } as SnakeCaseBundle,
+                } as TenantSnakeCaseBundle,
                 { merge: true },
               );
 
               if (data.targetAppVersion) {
-                const versionDocId = `${data.platform}_${data.channel}_${data.targetAppVersion}`;
+                // Tenant-scoped doc id prevents cross-tenant collision.
+                const versionDocId = `${appId}_${data.platform}_${data.channel}_${data.targetAppVersion}`;
                 const targetAppVersionsRef = db
                   .collection("target_app_versions")
                   .doc(versionDocId);
                 transaction.set(
                   targetAppVersionsRef,
                   {
+                    app_id: appId,
                     channel: data.channel,
                     platform: data.platform,
                     target_app_version: data.targetAppVersion,
@@ -512,12 +634,26 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
                 );
               }
             } else if (operation === "delete") {
-              // Delete the bundle document
+              // Defense-in-depth: verify the doc actually belongs to this
+              // tenant before deleting. The pre-read filter above already
+              // ensured this, but re-check guards against a concurrent
+              // cross-tenant write between read and delete.
+              const existingDoc = await transaction.get(bundleRef);
+              if (existingDoc.exists) {
+                const existingAppId = (
+                  existingDoc.data() as { app_id?: string } | undefined
+                )?.app_id;
+                if (existingAppId !== appId) {
+                  throw new Error(
+                    `Refusing to delete ${data.id}: belongs to ${existingAppId}, not ${appId}.`,
+                  );
+                }
+              }
               transaction.delete(bundleRef);
             }
           }
 
-          // Clean up orphaned target app versions
+          // Clean up orphaned target_app_versions for THIS tenant only.
           if (isTargetAppVersionChanged) {
             for (const targetDoc of targetVersionsSnapshot.docs) {
               if (!requiredTargetVersionKeys.has(targetDoc.id)) {
@@ -526,7 +662,7 @@ export const firebaseDatabase = createDatabasePlugin<admin.AppOptions>({
             }
           }
 
-          // Clean up orphaned channels
+          // Clean up orphaned channels for THIS tenant only.
           for (const channelDoc of channelsSnapshot.docs) {
             if (!requiredChannels.has(channelDoc.id)) {
               transaction.delete(channelDoc.ref);

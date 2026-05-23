@@ -5,6 +5,7 @@ import { Hono } from "hono";
 
 import { firebaseDatabase } from "../../src/firebaseDatabase";
 import { firebaseFunctionsStorage } from "../../src/firebaseFunctionsStorage";
+import { isValidAppId, tenantALS } from "../../src/tenantContext";
 
 // Hardcoded region for tile-push SaaS deployment.
 // Original hot-updater used a HotUpdater.REGION build-time substitution
@@ -53,6 +54,75 @@ app.get("/ping", (c) => {
 
 app.mount(HOT_UPDATER_BASE_PATH, hotUpdater.handler);
 
+// In-memory response cache. Persists across requests on the same warm Cloud
+// Run instance. Each instance has its own copy. TTL is short so a new deploy
+// is reflected within a minute.
+type CacheEntry = {
+  body: string;
+  status: number;
+  contentType: string;
+  expires: number;
+};
+const responseCache = new Map<string, CacheEntry>();
+const CACHE_TTL_MS = 60_000;
+
+// Cache key includes tenant scope so two tenants with otherwise-identical URLs
+// (after the /t/{appId}/ prefix is stripped) cannot share a cache entry.
+// Cross-tenant cache leakage would be a security bug.
+async function cachedFetch(
+  request: Request,
+  tenantScope: string | null,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const isCacheable =
+    request.method === "GET" && url.pathname.startsWith(`${HOT_UPDATER_BASE_PATH}/`);
+  const key = `${tenantScope ?? "_"}|${url.pathname}`;
+
+  if (isCacheable) {
+    const cached = responseCache.get(key);
+    if (cached && cached.expires > Date.now()) {
+      console.log(`[cache] HIT  ${key}`);
+      return new Response(cached.body, {
+        status: cached.status,
+        headers: {
+          "content-type": cached.contentType,
+          "x-tile-cache": "hit",
+        },
+      });
+    }
+  }
+
+  const response = await app.fetch(request);
+
+  if (isCacheable && response.status === 200) {
+    const clone = response.clone();
+    const body = await clone.text();
+    const contentType = clone.headers.get("content-type") || "application/json";
+    responseCache.set(key, {
+      body,
+      status: response.status,
+      contentType,
+      expires: Date.now() + CACHE_TTL_MS,
+    });
+    console.log(`[cache] MISS ${key}`);
+    return new Response(body, {
+      status: response.status,
+      headers: {
+        ...Object.fromEntries(response.headers.entries()),
+        "x-tile-cache": "miss",
+      },
+    });
+  }
+
+  return response;
+}
+
+// URL pattern: extract /t/{appId}/ tenant prefix from the v2 paths.
+// Stripped path is forwarded to the upstream handler — upstream code has no
+// knowledge of multi-tenancy. Tenant context flows via AsyncLocalStorage.
+const TENANT_URL_PATTERN =
+  /^(\/api\/check-update\/v2)\/t\/([^/]+)\/(.+)$/;
+
 const handler = onRequest(
   {
     region: REGION,
@@ -60,19 +130,60 @@ const handler = onRequest(
   async (req, res) => {
     const host = req.hostname;
     const requestPath = req.originalUrl || req.url;
-    const fullUrl = new URL(requestPath, `https://${host}`).toString();
+
+    // 1. Detect tenant prefix; extract appId; rewrite URL.
+    let appId: string | null = null;
+    let effectivePath = requestPath;
+
+    const tenantMatch = requestPath.match(TENANT_URL_PATTERN);
+    if (tenantMatch) {
+      const [, prefix, candidateAppId, rest] = tenantMatch;
+      if (!isValidAppId(candidateAppId)) {
+        res.status(400).json({
+          error:
+            "Invalid appId format. Expected /api/check-update/v2/t/{tk_slug}/...",
+        });
+        return;
+      }
+      appId = candidateAppId;
+      // Strip /t/{appId} so the inner handler sees the canonical v2 URL
+      effectivePath = `${prefix}/${rest}`;
+    } else if (requestPath.startsWith("/api/check-update/v2/")) {
+      // v2 path without /t/{appId}/ — explicit error rather than silently
+      // running on a "default" tenant. Fails closed.
+      res.status(400).json({
+        error:
+          "Tenant required. v2 endpoints must include /t/{appId}/ in the URL path.",
+      });
+      return;
+    }
+    // Non-v2 paths (e.g. /ping, /api/check-update/version) pass through
+    // without tenant context — they don't query tenant-scoped data.
+
+    const fullUrl = new URL(effectivePath, `https://${host}`).toString();
     const request = new Request(fullUrl, {
       method: req.method,
       headers: req.headers as Record<string, string>,
       body:
         req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined,
     });
-    const honoResponse = await app.fetch(request);
-    res.status(honoResponse.status);
-    for (const [key, value] of honoResponse.headers.entries()) {
-      res.setHeader(key, value);
+
+    // 2. Run the entire downstream stack inside an ALS context so the
+    //    firebase plugin can read appId via currentAppId() at any depth.
+    const runOnce = async () => {
+      const honoResponse = await cachedFetch(request, appId);
+      res.status(honoResponse.status);
+      for (const [key, value] of honoResponse.headers.entries()) {
+        res.setHeader(key, value);
+      }
+      res.send(await honoResponse.text());
+    };
+
+    if (appId) {
+      await tenantALS.run({ appId }, runOnce);
+    } else {
+      await runOnce();
     }
-    res.send(await honoResponse.text());
   },
 );
 
