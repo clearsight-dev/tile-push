@@ -4,6 +4,7 @@ export default defineConfig({
   entry: {
     config: "./src/config.ts",
     index: "./src/index.ts",
+    "commands/index": "./src/commands/index.ts",
   },
   deps: {
     neverBundle: ["@expo/fingerprint"],
@@ -18,6 +19,11 @@ export default defineConfig({
         types: "./dist/config.d.mts",
         import: "./dist/config.mjs",
         require: "./dist/config.mjs",
+      },
+      "./internal/commands": {
+        types: "./dist/commands/index.d.mts",
+        import: "./dist/commands/index.mjs",
+        require: "./dist/commands/index.mjs",
       },
     },
     exclude: ["index"],

@@ -1,0 +1,71 @@
+{
+  "name": "@tile-push/cli",
+  "version": "0.1.0",
+  "description": "Tile Push CLI — multi-tenant OTA deploys for React Native, built on top of hot-updater.",
+  "type": "module",
+  "bin": {
+    "tile-push": "./dist/bin/tile-push.mjs"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.cts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    },
+    "./bin/tile-push": {
+      "import": "./dist/bin/tile-push.mjs",
+      "require": "./dist/bin/tile-push.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "test:type": "tsc --noEmit"
+  },
+  "keywords": [
+    "react-native",
+    "ota",
+    "code-push",
+    "hot-updater",
+    "tile-push",
+    "cli"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "hot-updater": "workspace:*",
+    "@hot-updater/plugin-core": "workspace:*",
+    "@hot-updater/cli-tools": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "commander": "^14.0.0",
+    "open": "^10.1.0",
+    "picocolors": "^1.0.0",
+    "tsdown": "catalog:tools",
+    "typescript": "^6.0.2"
+  },
+  "inlinedDependencies": {
+    "bundle-name": "4.1.0",
+    "commander": "14.0.3",
+    "default-browser": "5.5.0",
+    "default-browser-id": "5.0.1",
+    "define-lazy-prop": "3.0.0",
+    "is-docker": "3.0.0",
+    "is-inside-container": "1.0.0",
+    "is-wsl": "3.1.1",
+    "open": "10.1.0",
+    "picocolors": "1.1.1",
+    "run-applescript": "7.0.0"
+  }
+}

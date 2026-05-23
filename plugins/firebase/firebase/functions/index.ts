@@ -6,6 +6,7 @@ import { Hono } from "hono";
 import { firebaseDatabase } from "../../src/firebaseDatabase";
 import { firebaseFunctionsStorage } from "../../src/firebaseFunctionsStorage";
 import { isValidAppId, tenantALS } from "../../src/tenantContext";
+import { cliApp } from "./cliRoutes";
 
 // Hardcoded region for tile-push SaaS deployment.
 // Original hot-updater used a HotUpdater.REGION build-time substitution
@@ -130,6 +131,44 @@ const handler = onRequest(
   async (req, res) => {
     const host = req.hostname;
     const requestPath = req.originalUrl || req.url;
+
+    // 0. CLI routes (deploy + bundle management). Bypass the v2 tenant URL
+    //    parser and the response cache — these are POST/PATCH/DELETE flows
+    //    with their own auth (Bearer token, in cliAuthMiddleware) and they
+    //    set ALS themselves. Caching deploys would be wrong.
+    //
+    //    cliApp's routes are defined without the /api/cli/ prefix (since
+    //    that's a mount-style prefix, not part of the route), so strip it
+    //    before forwarding. This mirrors how the upstream check-update mount
+    //    strips its own base path.
+    if (requestPath.startsWith("/api/cli/")) {
+      const strippedPath = requestPath.slice("/api/cli".length);
+      const fullUrl = new URL(strippedPath, `https://${host}`).toString();
+      // firebase-functions parses JSON bodies into objects before we see
+      // them. Hono expects a raw string/stream, so re-serialize. For non-
+      // JSON content types we'd need a different path, but our CLI routes
+      // only accept application/json today.
+      let body: BodyInit | undefined;
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        if (req.body && typeof req.body === "object") {
+          body = JSON.stringify(req.body);
+        } else if (typeof req.body === "string") {
+          body = req.body;
+        }
+      }
+      const cliRequest = new Request(fullUrl, {
+        method: req.method,
+        headers: req.headers as Record<string, string>,
+        body,
+      });
+      const honoResponse = await cliApp.fetch(cliRequest);
+      res.status(honoResponse.status);
+      for (const [key, value] of honoResponse.headers.entries()) {
+        res.setHeader(key, value);
+      }
+      res.send(await honoResponse.text());
+      return;
+    }
 
     // 1. Detect tenant prefix; extract appId; rewrite URL.
     let appId: string | null = null;

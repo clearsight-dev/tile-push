@@ -57,6 +57,14 @@
       "queryScope": "COLLECTION",
       "fields": [
         { "fieldPath": "app_id", "order": "ASCENDING" },
+        { "fieldPath": "id", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "bundles",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "app_id", "order": "ASCENDING" },
         { "fieldPath": "channel", "order": "ASCENDING" },
         { "fieldPath": "enabled", "order": "ASCENDING" },
         { "fieldPath": "platform", "order": "ASCENDING" },

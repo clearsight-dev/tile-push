@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": ".",
+    "lib": ["ESNext"],
+    "types": ["node"],
+    "paths": {
+      "hot-updater/internal/commands": [
+        "../../packages/hot-updater/src/commands/index.ts"
+      ],
+      "@hot-updater/plugin-core": ["../../plugins/plugin-core/src/index.ts"],
+      "@hot-updater/cli-tools": ["../../packages/cli-tools/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*", "bin/**/*"],
+  "exclude": ["dist", "node_modules"]
+}

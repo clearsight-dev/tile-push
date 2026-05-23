@@ -22,5 +22,9 @@ export const banner = (version?: string) =>
   );
 
 export const printBanner = (version?: string) => {
+  // Wrapper CLIs (e.g. tile-push) can suppress the banner by setting
+  // HOT_UPDATER_SKIP_BANNER=1 in the environment. They typically print
+  // their own branded banner before invoking commands.
+  if (process.env.HOT_UPDATER_SKIP_BANNER) return;
   console.log(banner(version));
 };

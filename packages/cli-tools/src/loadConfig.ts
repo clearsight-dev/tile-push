@@ -136,6 +136,11 @@ const getConfigLoaderOptions = (
   options: HotUpdaterConfigOptions,
 ): LoadConfigOptions<ConfigInput> => {
   const cwd = getCwd();
+  // Wrapper CLIs (e.g. tile-push) can override the canonical config filename
+  // by setting HOT_UPDATER_CONFIG_NAME. Defaults to "hot-updater.config".
+  const configName = process.env.HOT_UPDATER_CONFIG_NAME
+    ? `${process.env.HOT_UPDATER_CONFIG_NAME}.config`
+    : "hot-updater.config";
 
   return {
     cwd,
@@ -143,7 +148,7 @@ const getConfigLoaderOptions = (
     merge: false,
     sources: [
       {
-        files: "hot-updater.config",
+        files: configName,
         extensions: ["js", "cjs", "ts", "cts", "mjs", "mts"],
         rewrite: async (config: unknown) => {
           return typeof config === "function"
