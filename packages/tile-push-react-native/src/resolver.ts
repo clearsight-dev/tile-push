@@ -3,78 +3,9 @@ import type {
   ResolverCheckUpdateParams,
 } from "@hot-updater/react-native";
 
-/**
- * Internal v2 candidate shape. Matches the server response under
- * GET /api/check-update/v2/t/{appId}/fingerprint/...
- *
- * Defined locally (not re-imported) so the SDK remains decoupled from
- * the server package's exact type names — only the wire shape matters.
- */
-type V2Candidate = {
-  id: string;
-  status: "UPDATE" | "ROLLBACK" | "UP_TO_DATE";
-  fileUrl: string | null;
-  fileHash: string;
-  shouldForceUpdate?: boolean;
-  message?: string | null;
-  changedAssets?: Record<string, unknown>;
-  manifestUrl?: string | null;
-  manifestFileHash?: string | null;
-  /** Cohorts (1-1000) eligible for this bundle's rollout. */
-  eligibleNumericCohorts?: number[];
-  /** Custom cohort allowlist (slug strings). */
-  targetCohorts?: string[];
-};
-
-type V2Response = {
-  candidates: V2Candidate[];
-};
+import { pickEligibleCandidate, type V2Response } from "./picker";
 
 const DEFAULT_TIMEOUT_MS = 5000;
-
-/**
- * Pick the highest-priority candidate eligible for this device's cohort.
- *
- * Candidates arrive DESC sorted by id (newest first), so we walk in order
- * and return the first match. If the device's cohort is in a custom
- * targetCohorts allowlist or its numeric value is in eligibleNumericCohorts,
- * the candidate is eligible.
- *
- * Backward compat: if a candidate has neither field, treat it as eligible
- * for all cohorts (covers older server versions or full rollouts that
- * omit the metadata).
- */
-function pickEligibleCandidate(
-  candidates: V2Candidate[],
-  cohort: string | null | undefined,
-): V2Candidate | null {
-  const numericCohort =
-    cohort && /^\d+$/.test(cohort) ? Number.parseInt(cohort, 10) : null;
-
-  for (const candidate of candidates) {
-    const hasEligibilityMetadata =
-      Array.isArray(candidate.eligibleNumericCohorts) ||
-      Array.isArray(candidate.targetCohorts);
-
-    if (!hasEligibilityMetadata) {
-      // Server didn't ship eligibility info — assume open rollout.
-      return candidate;
-    }
-
-    if (cohort && candidate.targetCohorts?.includes(cohort)) {
-      return candidate;
-    }
-
-    if (
-      numericCohort !== null &&
-      candidate.eligibleNumericCohorts?.includes(numericCohort)
-    ) {
-      return candidate;
-    }
-  }
-
-  return null;
-}
 
 export interface TilePushResolverConfig {
   appId: string;
@@ -136,14 +67,12 @@ export function createTilePushResolver(
       const candidates = data?.candidates ?? [];
 
       const picked = pickEligibleCandidate(candidates, params.cohort);
-      if (!picked) {
-        return null;
-      }
+      if (!picked) return null;
 
-      // Device is already on the picked bundle → no update needed.
-      if (picked.id === params.bundleId) {
-        return null;
-      }
+      // If the picked candidate IS the device's current bundle, there's
+      // nothing to install — the device is already on a still-valid bundle.
+      // Mirrors v1's "current eligible → return null (up to date)" case.
+      if (picked.id === params.bundleId) return null;
 
       return picked as any;
     },
