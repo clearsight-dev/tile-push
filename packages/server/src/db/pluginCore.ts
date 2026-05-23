@@ -11,6 +11,7 @@ import {
   getRolledOutNumericCohorts,
   isCohortEligibleForUpdate,
   NIL_UUID,
+  NUMERIC_COHORT_SIZE,
   normalizeRolloutCohortCount,
 } from "@hot-updater/core";
 import {
@@ -32,6 +33,14 @@ import { resolveManifestArtifacts } from "./updateArtifacts";
 
 const PAGE_SIZE = 100;
 const DESC_ORDER = { field: "id", direction: "desc" } as const;
+
+// Cohort set that always passes the client picker's eligibility test —
+// attached to ROLLBACK candidates so the client treats them as universally
+// eligible, mirroring v1's "rollback ignores cohort" behavior.
+const ALL_NUMERIC_COHORTS: number[] = Array.from(
+  { length: NUMERIC_COHORT_SIZE },
+  (_, i) => i + 1,
+);
 
 const bundleMatchesQueryWhere = (
   bundle: Bundle,
@@ -451,43 +460,113 @@ export function createPluginDatabaseCore<TContext = unknown>(
       args: GetBundlesArgs,
       context?: HotUpdaterContext<TContext>,
     ): Promise<AppUpdateCandidatesResponse> {
+      // ─────────────────────────────────────────────────────────────────────
+      // v2 candidates: mirror v1's `findUpdateInfoByScanning` walk structure,
+      // but DO NOT filter by cohort eligibility (that moves to the client).
+      // Tag each bundle with its v1-equivalent status, short-circuit on the
+      // first older bundle (ROLLBACK target), and append the same after-loop
+      // INIT_BUNDLE_ROLLBACK that v1 emits — under the same gating
+      // conditions. The client picker becomes a trivial cohort filter.
+      //
+      // Each candidate carries `eligibleNumericCohorts` + `targetCohorts`.
+      // ROLLBACK candidates (real older or synthetic init-rollback) are
+      // marked always-eligible to mirror v1's "no cohort check on rollback"
+      // behavior.
+      // ─────────────────────────────────────────────────────────────────────
       const channel = args.channel ?? "production";
       const minBundleId = args.minBundleId ?? NIL_UUID;
+      const currentBundleId = args.bundleId ?? NIL_UUID;
       const baseWhere = getBaseWhere({
         platform: args.platform,
         channel,
         minBundleId,
       });
 
-      let bundles: Bundle[];
-      if (args._updateStrategy === "fingerprint") {
-        bundles = await findAllCandidatesByScanning({
-          queryWhere: {
-            ...baseWhere,
-            fingerprintHash: args.fingerprintHash,
+      const queryWhere: DatabaseBundleQueryWhere =
+        args._updateStrategy === "fingerprint"
+          ? { ...baseWhere, fingerprintHash: args.fingerprintHash }
+          : baseWhere;
+
+      const isCandidate = (bundle: Bundle): boolean => {
+        if (
+          !bundle.enabled ||
+          bundle.platform !== args.platform ||
+          bundle.channel !== channel ||
+          bundle.id.localeCompare(minBundleId) < 0
+        ) {
+          return false;
+        }
+        if (args._updateStrategy === "fingerprint") {
+          return bundle.fingerprintHash === args.fingerprintHash;
+        }
+        return (
+          !!bundle.targetAppVersion &&
+          semverSatisfies(bundle.targetAppVersion, args.appVersion)
+        );
+      };
+
+      // Walk DESC, bucket each bundle. Short-circuits on first older bundle.
+      type Tagged = {
+        bundle: Bundle;
+        status: "UPDATE" | "ROLLBACK";
+        alwaysEligible: boolean;
+      };
+      const tagged: Tagged[] = [];
+      let stop = false;
+      let after: string | undefined;
+
+      while (!stop) {
+        const { data, pagination } = await getSortedBundlePage(
+          {
+            where: queryWhere,
+            limit: PAGE_SIZE,
+            orderBy: DESC_ORDER,
+            ...(after ? { cursor: { after } } : {}),
           },
           context,
-          isCandidate: (bundle) =>
-            bundle.enabled &&
-            bundle.platform === args.platform &&
-            bundle.channel === channel &&
-            bundle.id.localeCompare(minBundleId) >= 0 &&
-            bundle.fingerprintHash === args.fingerprintHash,
-        });
-      } else {
-        bundles = await findAllCandidatesByScanning({
-          queryWhere: baseWhere,
-          context,
-          isCandidate: (bundle) =>
-            bundle.enabled &&
-            bundle.platform === args.platform &&
-            bundle.channel === channel &&
-            bundle.id.localeCompare(minBundleId) >= 0 &&
-            !!bundle.targetAppVersion &&
-            semverSatisfies(bundle.targetAppVersion, args.appVersion),
-        });
+        );
+
+        for (const bundle of data) {
+          if (
+            !bundleMatchesQueryWhere(bundle, queryWhere) ||
+            !isCandidate(bundle)
+          ) {
+            continue;
+          }
+
+          if (currentBundleId === NIL_UUID) {
+            // Fresh install: every bundle is a potential upgrade.
+            tagged.push({ bundle, status: "UPDATE", alwaysEligible: false });
+            continue;
+          }
+
+          const cmp = bundle.id.localeCompare(currentBundleId);
+
+          if (cmp > 0) {
+            tagged.push({ bundle, status: "UPDATE", alwaysEligible: false });
+            continue;
+          }
+          if (cmp === 0) {
+            // Current bundle. Tagged UPDATE; client picker returns null when
+            // `picked.id === currentBundleId` so SDK no-ops on this case.
+            tagged.push({ bundle, status: "UPDATE", alwaysEligible: false });
+            continue;
+          }
+          // cmp < 0 — first bundle older than current; ROLLBACK target.
+          // v1 returns this without a cohort check, so we mark it
+          // always-eligible and stop scanning (mirroring v1 short-circuit).
+          tagged.push({ bundle, status: "ROLLBACK", alwaysEligible: true });
+          stop = true;
+          break;
+        }
+
+        if (stop || !pagination.hasNextPage) break;
+        after = data.at(-1)?.id;
+        if (!after) break;
       }
 
+      // Enrich each tagged bundle into AppUpdateCandidate (preserve the
+      // existing manifest/fileUrl/cohort logic from the original v2 impl).
       const readStorageText = options?.readStorageText;
       const currentBundle =
         args.bundleId && args.bundleId !== NIL_UUID
@@ -495,8 +574,8 @@ export function createPluginDatabaseCore<TContext = unknown>(
           : null;
 
       const candidates: AppUpdateCandidate[] = await Promise.all(
-        bundles.map(async (bundle) => {
-          const baseInfo = makeResponse(bundle, "UPDATE");
+        tagged.map(async ({ bundle, status, alwaysEligible }) => {
+          const baseInfo = makeResponse(bundle, status);
           const { storageUri, ...rest } = baseInfo as UpdateInfo & {
             storageUri: string | null;
           };
@@ -521,18 +600,44 @@ export function createPluginDatabaseCore<TContext = unknown>(
           const normalizedRolloutCount = normalizeRolloutCohortCount(
             bundle.rolloutCohortCount,
           );
+          const eligibleNumericCohorts = alwaysEligible
+            ? ALL_NUMERIC_COHORTS
+            : getRolledOutNumericCohorts(
+                bundle.id,
+                bundle.rolloutCohortCount,
+              );
 
           return {
             ...enriched,
             rolloutCohortCount: normalizedRolloutCount,
-            targetCohorts: bundle.targetCohorts ?? [],
-            eligibleNumericCohorts: getRolledOutNumericCohorts(
-              bundle.id,
-              bundle.rolloutCohortCount,
-            ),
+            targetCohorts: alwaysEligible
+              ? []
+              : (bundle.targetCohorts ?? []),
+            eligibleNumericCohorts,
           };
         }),
       );
+
+      // Append INIT_BUNDLE_ROLLBACK synthetic ONLY under v1's gating —
+      // NOT for fresh installs (NIL_UUID), NOT when current is below
+      // minBundleId. v1 returns null in those cases; we mirror by simply
+      // not emitting the synthetic.
+      if (
+        currentBundleId !== NIL_UUID &&
+        currentBundleId.localeCompare(minBundleId) > 0
+      ) {
+        candidates.push({
+          message: null,
+          id: NIL_UUID,
+          shouldForceUpdate: true,
+          status: "ROLLBACK",
+          fileHash: null,
+          fileUrl: null,
+          rolloutCohortCount: NUMERIC_COHORT_SIZE,
+          targetCohorts: [],
+          eligibleNumericCohorts: ALL_NUMERIC_COHORTS,
+        } as AppUpdateCandidate);
+      }
 
       return { candidates };
     },
