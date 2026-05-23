@@ -1786,6 +1786,27 @@ importers:
         specifier: 'catalog:'
         version: 4.1.4(@opentelemetry/api@1.9.0)(@types/node@20.19.11)(jsdom@29.0.0(@noble/hashes@1.8.0))(msw@2.12.10(@types/node@20.19.11)(typescript@6.0.2))(vite@8.0.8(@types/node@20.19.11)(esbuild@0.27.4)(jiti@2.6.1)(sass-embedded@1.83.0)(terser@5.46.2)(tsx@4.21.0)(yaml@2.6.1))
 
+  packages/tile-push-react-native:
+    devDependencies:
+      '@hot-updater/react-native':
+        specifier: workspace:*
+        version: link:../react-native
+      '@types/react':
+        specifier: 19.1.3
+        version: 19.1.3
+      react:
+        specifier: 19.1.3
+        version: 19.1.3
+      react-native:
+        specifier: 0.79.1
+        version: 0.79.1(@babel/core@7.29.0)(@react-native-community/cli@20.1.0(typescript@6.0.2))(@types/react@19.1.3)(react@19.1.3)
+      tsdown:
+        specifier: catalog:tools
+        version: 0.21.6(@emnapi/core@1.10.0)(@emnapi/runtime@1.10.0)(synckit@0.11.11)(typescript@6.0.2)
+      typescript:
+        specifier: ^6.0.2
+        version: 6.0.2
+
   plugins/aws:
     dependencies:
       '@aws-sdk/client-cloudfront':
@@ -16642,10 +16663,6 @@ packages:
     resolution: {integrity: sha512-fBoRgqkF69CwyPtBNxlDi5ha26Zc8f85n2THXYoh13Jn/Bkg8KIDCdKPp/A1BbSeNnkH/++H2EIIfnmaff4uRg==}
     engines: {node: '>=18.18'}
 
-  metro-runtime@0.82.1:
-    resolution: {integrity: sha512-Xg7FccIHlNtI63RX0vKmIzXlM5eSq4mjMo0ALbxXpds/P4JVT0JeJW/BqwpncKabrpbZyvPmPguhd32TiMWHXg==}
-    engines: {node: '>=18.18'}
-
   metro-runtime@0.82.5:
     resolution: {integrity: sha512-rQZDoCUf7k4Broyw3Ixxlq5ieIPiR1ULONdpcYpbJQ6yQ5GGEyYjtkztGD+OhHlw81LCR2SUAoPvtTus2WDK5g==}
     engines: {node: '>=18.18'}
@@ -16668,10 +16685,6 @@ packages:
 
   metro-source-map@0.81.4:
     resolution: {integrity: sha512-IOwVQ7mLqoqvsL70RZtl1EyE3f9jp43kVsAsb/B/zoWmu0/k4mwEhGLTxmjdXRkLJqPqPrh7WmFChAEf9trW4Q==}
-    engines: {node: '>=18.18'}
-
-  metro-source-map@0.82.1:
-    resolution: {integrity: sha512-uCf60ybpmPvkkqQpVWtPZFCIMBS1D9uQ4r2isbqWvDQ1FFTi3xrhT1Z35Dyg30RQV6638XJ4wZY+Dwh8bU9W8A==}
     engines: {node: '>=18.18'}
 
   metro-source-map@0.82.5:
@@ -16698,11 +16711,6 @@ packages:
 
   metro-symbolicate@0.81.4:
     resolution: {integrity: sha512-rWxTmYVN6/BOSaMDUHT8HgCuRf6acd0AjHkenYlHpmgxg7dqdnAG1hLq999q2XpW5rX+cMamZD5W5Ez2LqGaag==}
-    engines: {node: '>=18.18'}
-    hasBin: true
-
-  metro-symbolicate@0.82.1:
-    resolution: {integrity: sha512-UFofSe+y0tz+nQ5XOkgXOYu5xlbX/8jEvd2eSrd8SjAX7eAjbGwN0Kjji+87jSaMJIvRHkArVMWqwF6fZVq55g==}
     engines: {node: '>=18.18'}
     hasBin: true
 
@@ -17438,10 +17446,6 @@ packages:
 
   ob1@0.81.4:
     resolution: {integrity: sha512-EZLYM8hfPraC2SYOR5EWLFAPV5e6g+p83m2Jth9bzCpFxP1NDQJYXdmXRB2bfbaWQSmm6NkIQlbzk7uU5lLfgg==}
-    engines: {node: '>=18.18'}
-
-  ob1@0.82.1:
-    resolution: {integrity: sha512-J4m1GAoMC0673H8LmVolj7ZERYEwJWRR4/A/M8ZB5iK9BiFLeAkjvny/VGk3XOYiMtnvq7TV6oc3MfDJ8uKpFw==}
     engines: {node: '>=18.18'}
 
   ob1@0.82.5:
@@ -18382,9 +18386,6 @@ packages:
 
   react-devtools-core@6.0.1:
     resolution: {integrity: sha512-II3iSJhnR5nAscYDa9FCgPLq8mO5aEx/EKKtdXYTDnvdFEa3K7gs3jn1SKRXwQf9maOmIilmjnnx7Qy+3annPA==}
-
-  react-devtools-core@6.1.1:
-    resolution: {integrity: sha512-TFo1MEnkqE6hzAbaztnyR5uLTMoz6wnEWwWBsCUzNt+sVXJycuRJdDqvL078M4/h65BI/YO5XWTaxZDWVsW0fw==}
 
   react-devtools-core@6.1.5:
     resolution: {integrity: sha512-ePrwPfxAnB+7hgnEr8vpKxL9cmnp7F322t8oqcPshbIQQhDKgFDW4tjhF2wjVbdXF9O/nyuy3sQWd9JGpiLPvA==}
@@ -22009,7 +22010,7 @@ snapshots:
     dependencies:
       '@aws-sdk/types': 3.973.6
       '@aws-sdk/xml-builder': 3.972.16
-      '@smithy/core': 3.23.11
+      '@smithy/core': 3.23.12
       '@smithy/node-config-provider': 4.3.12
       '@smithy/property-provider': 4.2.12
       '@smithy/protocol-http': 5.3.12
@@ -22284,7 +22285,7 @@ snapshots:
       '@aws-sdk/core': 3.973.25
       '@aws-sdk/types': 3.973.6
       '@aws-sdk/util-endpoints': 3.996.5
-      '@smithy/core': 3.23.11
+      '@smithy/core': 3.23.12
       '@smithy/protocol-http': 5.3.12
       '@smithy/types': 4.13.1
       '@smithy/util-retry': 4.2.12
@@ -22353,14 +22354,14 @@ snapshots:
       '@smithy/hash-node': 4.2.12
       '@smithy/invalid-dependency': 4.2.12
       '@smithy/middleware-content-length': 4.2.12
-      '@smithy/middleware-endpoint': 4.4.25
+      '@smithy/middleware-endpoint': 4.4.27
       '@smithy/middleware-retry': 4.4.44
       '@smithy/middleware-serde': 4.2.15
       '@smithy/middleware-stack': 4.2.12
       '@smithy/node-config-provider': 4.3.12
       '@smithy/node-http-handler': 4.5.0
       '@smithy/protocol-http': 5.3.12
-      '@smithy/smithy-client': 4.12.5
+      '@smithy/smithy-client': 4.12.7
       '@smithy/types': 4.13.1
       '@smithy/url-parser': 4.2.12
       '@smithy/util-base64': 4.3.2
@@ -32050,6 +32051,23 @@ snapshots:
       - supports-color
       - utf-8-validate
 
+  '@react-native/community-cli-plugin@0.79.1(@react-native-community/cli@20.1.0(typescript@6.0.2))':
+    dependencies:
+      '@react-native/dev-middleware': 0.79.1
+      chalk: 4.1.2
+      debug: 2.6.9
+      invariant: 2.2.4
+      metro: 0.82.5
+      metro-config: 0.82.5
+      metro-core: 0.82.5
+      semver: 7.7.4
+    optionalDependencies:
+      '@react-native-community/cli': 20.1.0(typescript@6.0.2)
+    transitivePeerDependencies:
+      - bufferutil
+      - supports-color
+      - utf-8-validate
+
   '@react-native/community-cli-plugin@0.80.1(@react-native-community/cli@20.1.0(typescript@6.0.2))':
     dependencies:
       '@react-native/dev-middleware': 0.80.1
@@ -32610,6 +32628,15 @@ snapshots:
       nullthrows: 1.1.1
       react: 19.1.3
       react-native: 0.79.1(@babel/core@7.29.0)(@react-native-community/cli@18.0.0(typescript@6.0.2))(@types/react@19.1.3)(react@19.1.3)
+    optionalDependencies:
+      '@types/react': 19.1.3
+
+  '@react-native/virtualized-lists@0.79.1(@types/react@19.1.3)(react-native@0.79.1(@babel/core@7.29.0)(@react-native-community/cli@20.1.0(typescript@6.0.2))(@types/react@19.1.3)(react@19.1.3))(react@19.1.3)':
+    dependencies:
+      invariant: 2.2.4
+      nullthrows: 1.1.1
+      react: 19.1.3
+      react-native: 0.79.1(@babel/core@7.29.0)(@react-native-community/cli@20.1.0(typescript@6.0.2))(@types/react@19.1.3)(react@19.1.3)
     optionalDependencies:
       '@types/react': 19.1.3
 
@@ -34622,7 +34649,7 @@ snapshots:
 
   '@types/react@19.1.3':
     dependencies:
-      csstype: 3.1.2
+      csstype: 3.2.3
 
   '@types/react@19.2.14':
     dependencies:
@@ -42794,11 +42821,6 @@ snapshots:
       '@babel/runtime': 7.28.6
       flow-enums-runtime: 0.0.6
 
-  metro-runtime@0.82.1:
-    dependencies:
-      '@babel/runtime': 7.28.6
-      flow-enums-runtime: 0.0.6
-
   metro-runtime@0.82.5:
     dependencies:
       '@babel/runtime': 7.28.6
@@ -42852,21 +42874,6 @@ snapshots:
       metro-symbolicate: 0.81.4
       nullthrows: 1.1.1
       ob1: 0.81.4
-      source-map: 0.5.7
-      vlq: 1.0.1
-    transitivePeerDependencies:
-      - supports-color
-
-  metro-source-map@0.82.1:
-    dependencies:
-      '@babel/traverse': 7.25.9
-      '@babel/traverse--for-generate-function-map': '@babel/traverse@7.29.0'
-      '@babel/types': 7.26.0
-      flow-enums-runtime: 0.0.6
-      invariant: 2.2.4
-      metro-symbolicate: 0.82.1
-      nullthrows: 1.1.1
-      ob1: 0.82.1
       source-map: 0.5.7
       vlq: 1.0.1
     transitivePeerDependencies:
@@ -42943,17 +42950,6 @@ snapshots:
       flow-enums-runtime: 0.0.6
       invariant: 2.2.4
       metro-source-map: 0.81.4
-      nullthrows: 1.1.1
-      source-map: 0.5.7
-      vlq: 1.0.1
-    transitivePeerDependencies:
-      - supports-color
-
-  metro-symbolicate@0.82.1:
-    dependencies:
-      flow-enums-runtime: 0.0.6
-      invariant: 2.2.4
-      metro-source-map: 0.82.1
       nullthrows: 1.1.1
       source-map: 0.5.7
       vlq: 1.0.1
@@ -44390,10 +44386,6 @@ snapshots:
     dependencies:
       flow-enums-runtime: 0.0.6
 
-  ob1@0.82.1:
-    dependencies:
-      flow-enums-runtime: 0.0.6
-
   ob1@0.82.5:
     dependencies:
       flow-enums-runtime: 0.0.6
@@ -45526,14 +45518,6 @@ snapshots:
       - bufferutil
       - utf-8-validate
 
-  react-devtools-core@6.1.1:
-    dependencies:
-      shell-quote: 1.8.1
-      ws: 7.5.10
-    transitivePeerDependencies:
-      - bufferutil
-      - utf-8-validate
-
   react-devtools-core@6.1.5:
     dependencies:
       shell-quote: 1.8.1
@@ -45910,13 +45894,61 @@ snapshots:
       invariant: 2.2.4
       jest-environment-node: 29.7.0
       memoize-one: 5.2.1
-      metro-runtime: 0.82.1
-      metro-source-map: 0.82.1
+      metro-runtime: 0.82.5
+      metro-source-map: 0.82.5
       nullthrows: 1.1.1
       pretty-format: 29.7.0
       promise: 8.3.0
       react: 19.1.3
-      react-devtools-core: 6.1.1
+      react-devtools-core: 6.1.5
+      react-refresh: 0.14.2
+      regenerator-runtime: 0.13.11
+      scheduler: 0.25.0
+      semver: 7.7.4
+      stacktrace-parser: 0.1.10
+      whatwg-fetch: 3.6.19
+      ws: 6.2.3
+      yargs: 17.7.2
+    optionalDependencies:
+      '@types/react': 19.1.3
+    transitivePeerDependencies:
+      - '@babel/core'
+      - '@react-native-community/cli'
+      - bufferutil
+      - supports-color
+      - utf-8-validate
+
+  react-native@0.79.1(@babel/core@7.29.0)(@react-native-community/cli@20.1.0(typescript@6.0.2))(@types/react@19.1.3)(react@19.1.3):
+    dependencies:
+      '@jest/create-cache-key-function': 29.7.0
+      '@react-native/assets-registry': 0.79.1
+      '@react-native/codegen': 0.79.1(@babel/core@7.29.0)
+      '@react-native/community-cli-plugin': 0.79.1(@react-native-community/cli@20.1.0(typescript@6.0.2))
+      '@react-native/gradle-plugin': 0.79.1
+      '@react-native/js-polyfills': 0.79.1
+      '@react-native/normalize-colors': 0.79.1
+      '@react-native/virtualized-lists': 0.79.1(@types/react@19.1.3)(react-native@0.79.1(@babel/core@7.29.0)(@react-native-community/cli@20.1.0(typescript@6.0.2))(@types/react@19.1.3)(react@19.1.3))(react@19.1.3)
+      abort-controller: 3.0.0
+      anser: 1.4.10
+      ansi-regex: 5.0.1
+      babel-jest: 29.7.0(@babel/core@7.29.0)
+      babel-plugin-syntax-hermes-parser: 0.25.1
+      base64-js: 1.5.1
+      chalk: 4.1.2
+      commander: 12.1.0
+      event-target-shim: 5.0.1
+      flow-enums-runtime: 0.0.6
+      glob: 7.2.3
+      invariant: 2.2.4
+      jest-environment-node: 29.7.0
+      memoize-one: 5.2.1
+      metro-runtime: 0.82.5
+      metro-source-map: 0.82.5
+      nullthrows: 1.1.1
+      pretty-format: 29.7.0
+      promise: 8.3.0
+      react: 19.1.3
+      react-devtools-core: 6.1.5
       react-refresh: 0.14.2
       regenerator-runtime: 0.13.11
       scheduler: 0.25.0

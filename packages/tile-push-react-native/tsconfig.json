@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "jsx": "react-native",
+    "lib": ["ESNext", "DOM"],
+    "types": [],
+    "paths": {
+      "@hot-updater/server/runtime": ["../../packages/server/src/runtime.ts"],
+      "@hot-updater/react-native": ["../../packages/react-native/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*"],
+  "exclude": ["dist", "node_modules"]
+}
