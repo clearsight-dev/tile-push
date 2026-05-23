@@ -7,7 +7,12 @@ import type {
   Platform,
   UpdateInfo,
 } from "@hot-updater/core";
-import { isCohortEligibleForUpdate, NIL_UUID } from "@hot-updater/core";
+import {
+  getRolledOutNumericCohorts,
+  isCohortEligibleForUpdate,
+  NIL_UUID,
+  normalizeRolloutCohortCount,
+} from "@hot-updater/core";
 import {
   type DatabaseBundleQueryOptions,
   type DatabaseBundleQueryOrder,
@@ -18,7 +23,11 @@ import {
 } from "@hot-updater/plugin-core";
 
 import { assertBundlePersistenceConstraints } from "./schemaEnhancements";
-import type { DatabaseAPI } from "./types";
+import type {
+  AppUpdateCandidate,
+  AppUpdateCandidatesResponse,
+  DatabaseAPI,
+} from "./types";
 import { resolveManifestArtifacts } from "./updateArtifacts";
 
 const PAGE_SIZE = 100;
@@ -165,6 +174,61 @@ export function createPluginDatabaseCore<TContext = unknown>(
       bundle.rolloutCohortCount,
       bundle.targetCohorts,
     );
+  };
+
+  // Collects all bundles that match the candidate filter (platform, channel,
+  // fingerprint / app-version), regardless of cohort. Used by the v2
+  // candidates endpoint where the client picks based on its local cohort.
+  const findAllCandidatesByScanning = async ({
+    queryWhere,
+    isCandidate,
+    context,
+  }: {
+    queryWhere: DatabaseBundleQueryWhere;
+    isCandidate: (bundle: Bundle) => boolean;
+    context?: HotUpdaterContext<TContext>;
+  }): Promise<Bundle[]> => {
+    const collected: Bundle[] = [];
+    let after: string | undefined;
+
+    while (true) {
+      const { data, pagination } = await getSortedBundlePage(
+        {
+          where: queryWhere,
+          limit: PAGE_SIZE,
+          orderBy: DESC_ORDER,
+          ...(after
+            ? {
+                cursor: {
+                  after,
+                },
+              }
+            : {}),
+        },
+        context,
+      );
+
+      for (const bundle of data) {
+        if (
+          !bundleMatchesQueryWhere(bundle, queryWhere) ||
+          !isCandidate(bundle)
+        ) {
+          continue;
+        }
+        collected.push(bundle);
+      }
+
+      if (!pagination.hasNextPage) {
+        break;
+      }
+
+      after = data.at(-1)?.id;
+      if (!after) {
+        break;
+      }
+    }
+
+    return collected;
   };
 
   const findUpdateInfoByScanning = async ({
@@ -381,6 +445,96 @@ export function createPluginDatabaseCore<TContext = unknown>(
         ...baseResponse,
         ...manifestArtifacts,
       };
+    },
+
+    async getAppUpdateCandidates(
+      args: GetBundlesArgs,
+      context?: HotUpdaterContext<TContext>,
+    ): Promise<AppUpdateCandidatesResponse> {
+      const channel = args.channel ?? "production";
+      const minBundleId = args.minBundleId ?? NIL_UUID;
+      const baseWhere = getBaseWhere({
+        platform: args.platform,
+        channel,
+        minBundleId,
+      });
+
+      let bundles: Bundle[];
+      if (args._updateStrategy === "fingerprint") {
+        bundles = await findAllCandidatesByScanning({
+          queryWhere: {
+            ...baseWhere,
+            fingerprintHash: args.fingerprintHash,
+          },
+          context,
+          isCandidate: (bundle) =>
+            bundle.enabled &&
+            bundle.platform === args.platform &&
+            bundle.channel === channel &&
+            bundle.id.localeCompare(minBundleId) >= 0 &&
+            bundle.fingerprintHash === args.fingerprintHash,
+        });
+      } else {
+        bundles = await findAllCandidatesByScanning({
+          queryWhere: baseWhere,
+          context,
+          isCandidate: (bundle) =>
+            bundle.enabled &&
+            bundle.platform === args.platform &&
+            bundle.channel === channel &&
+            bundle.id.localeCompare(minBundleId) >= 0 &&
+            !!bundle.targetAppVersion &&
+            semverSatisfies(bundle.targetAppVersion, args.appVersion),
+        });
+      }
+
+      const readStorageText = options?.readStorageText;
+      const currentBundle =
+        args.bundleId && args.bundleId !== NIL_UUID
+          ? await getPlugin().getBundleById(args.bundleId, context)
+          : null;
+
+      const candidates: AppUpdateCandidate[] = await Promise.all(
+        bundles.map(async (bundle) => {
+          const baseInfo = makeResponse(bundle, "UPDATE");
+          const { storageUri, ...rest } = baseInfo as UpdateInfo & {
+            storageUri: string | null;
+          };
+
+          const fileUrl = await resolveFileUrl(storageUri ?? null, context);
+          const baseResponse: AppUpdateAvailableInfo = { ...rest, fileUrl };
+
+          let enriched: AppUpdateAvailableInfo = baseResponse;
+          if (readStorageText) {
+            const manifestArtifacts = await resolveManifestArtifacts({
+              currentBundle,
+              resolveFileUrl,
+              readStorageText,
+              targetBundle: bundle,
+              context,
+            });
+            if (manifestArtifacts) {
+              enriched = { ...baseResponse, ...manifestArtifacts };
+            }
+          }
+
+          const normalizedRolloutCount = normalizeRolloutCohortCount(
+            bundle.rolloutCohortCount,
+          );
+
+          return {
+            ...enriched,
+            rolloutCohortCount: normalizedRolloutCount,
+            targetCohorts: bundle.targetCohorts ?? [],
+            eligibleNumericCohorts: getRolledOutNumericCohorts(
+              bundle.id,
+              bundle.rolloutCohortCount,
+            ),
+          };
+        }),
+      );
+
+      return { candidates };
     },
 
     async getChannels(

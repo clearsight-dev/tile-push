@@ -12,6 +12,7 @@ import type {
 } from "@hot-updater/plugin-core";
 import semver from "semver";
 
+import type { AppUpdateCandidatesResponse } from "./db/types";
 import { addRoute, createRouter, findRoute } from "./internalRouter";
 import type { ChannelsResponse, PaginatedResult } from "./types";
 import { HOT_UPDATER_SERVER_VERSION } from "./version";
@@ -22,6 +23,10 @@ export interface HandlerAPI<TContext = unknown> {
     args: AppVersionGetBundlesArgs | FingerprintGetBundlesArgs,
     context?: HotUpdaterContext<TContext>,
   ) => Promise<AppUpdateAvailableInfo | null>;
+  getAppUpdateCandidates: (
+    args: AppVersionGetBundlesArgs | FingerprintGetBundlesArgs,
+    context?: HotUpdaterContext<TContext>,
+  ) => Promise<AppUpdateCandidatesResponse>;
   getBundleById: (
     id: string,
     context?: HotUpdaterContext<TContext>,
@@ -277,6 +282,72 @@ const handleFingerprintUpdateWithCohort: RouteHandler = async (
   });
 };
 
+// v2: cohort-less endpoint that returns ALL eligible candidate bundles.
+// Designed for CDN caching — same URL across devices with different cohorts
+// gives ~100% hit rate. Client picks the matching bundle locally based on its
+// cohort and each candidate's eligibleNumericCohorts / targetCohorts.
+const handleFingerprintCandidates: RouteHandler = async (
+  params,
+  _request,
+  api,
+  context,
+) => {
+  const platform = requirePlatformParam(params);
+  const fingerprintHash = requireRouteParam(params, "fingerprintHash");
+  const channel = requireRouteParam(params, "channel");
+  const minBundleId = requireRouteParam(params, "minBundleId");
+  const bundleId = requireRouteParam(params, "bundleId");
+
+  const result = await api.getAppUpdateCandidates(
+    {
+      _updateStrategy: "fingerprint",
+      platform,
+      fingerprintHash,
+      channel,
+      minBundleId,
+      bundleId,
+      cohort: undefined,
+    },
+    context,
+  );
+
+  return new Response(JSON.stringify(result), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+};
+
+const handleAppVersionCandidates: RouteHandler = async (
+  params,
+  _request,
+  api,
+  context,
+) => {
+  const platform = requirePlatformParam(params);
+  const appVersion = requireRouteParam(params, "appVersion");
+  const channel = requireRouteParam(params, "channel");
+  const minBundleId = requireRouteParam(params, "minBundleId");
+  const bundleId = requireRouteParam(params, "bundleId");
+
+  const result = await api.getAppUpdateCandidates(
+    {
+      _updateStrategy: "appVersion",
+      platform,
+      appVersion,
+      channel,
+      minBundleId,
+      bundleId,
+      cohort: undefined,
+    },
+    context,
+  );
+
+  return new Response(JSON.stringify(result), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+};
+
 const handleAppVersionUpdateWithCohort: RouteHandler = async (
   params,
   request,
@@ -517,6 +588,8 @@ const routes: Record<string, RouteHandler<any>> = {
   version: handleVersion,
   fingerprintUpdateWithCohort: handleFingerprintUpdateWithCohort,
   appVersionUpdateWithCohort: handleAppVersionUpdateWithCohort,
+  fingerprintCandidates: handleFingerprintCandidates,
+  appVersionCandidates: handleAppVersionCandidates,
   getBundle: handleGetBundle,
   getBundles: handleGetBundles,
   createBundles: handleCreateBundles,
@@ -573,6 +646,19 @@ export function createHandler<TContext = unknown>(
       "GET",
       "/app-version/:platform/:appVersion/:channel/:minBundleId/:bundleId/:cohort",
       "appVersionUpdateWithCohort",
+    );
+    // v2: CDN-cacheable candidates endpoint (no cohort in URL)
+    addRoute(
+      router,
+      "GET",
+      "/v2/fingerprint/:platform/:fingerprintHash/:channel/:minBundleId/:bundleId",
+      "fingerprintCandidates",
+    );
+    addRoute(
+      router,
+      "GET",
+      "/v2/app-version/:platform/:appVersion/:channel/:minBundleId/:bundleId",
+      "appVersionCandidates",
     );
   }
 
