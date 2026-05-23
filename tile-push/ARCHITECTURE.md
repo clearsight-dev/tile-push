@@ -1,60 +1,98 @@
 # tile-push Architecture
 
-This document describes the current single-tenant MVP architecture and how it works end-to-end. Read this when you need to understand what runs where, why it's structured the way it is, or how to change it.
+This document describes the current multi-tenant MVP architecture and how it works end-to-end. Read this when you need to understand what runs where, why it's structured the way it is, or how to change it.
 
 ## High-level diagram
 
 ```
-┌──────────────────┐                                       ┌──────────────────────────┐
-│ React Native app │                                       │  GCP: apptile-staging-   │
-│  (customer's)    │                                       │       setup project      │
-│                  │                                       │                          │
-│  - calls         │── HTTPS GET /api/check-update/... ──▶ │  Cloud Function          │
-│    /fingerprint  │   { JSON request }                    │  (Gen 2 / Cloud Run)     │
-│    /app-version  │ ◀── { fileUrl, status, hash, ... } ── │   tile-push              │
-│                  │                                       │   us-central1            │
-│  - if AVAILABLE  │                                       │                          │
-│    downloads     │                                       │  ┌─ uses ───────────┐    │
-│    fileUrl       │                                       │  ▼                  │    │
-└──────────────────┘                                       │  Firestore          │    │
-        │                                                  │  database:tile-push │    │
-        │                                                  │  collection:bundles │    │
-        │                                                  │                     │    │
-        │                                                  │  ┌─ generates       │    │
-        │                                                  │  │  download URL    │    │
-        │                                                  │  ▼                  │    │
-        │                                                  │  Firebase Storage   │    │
-        │                                                  │  bucket:            │    │
-        │                                                  │   tile-push-bundles │    │
-        │                                                  └──────────┬──────────┘    │
-        │                                                             │               │
-        │  GET https://...firebasestorage.googleapis.com/...zip       │               │
-        └─────────────────────────────────────────────────────────────┘               │
-                                                                                      │
-                                                          ┌───────────────────────────┘
+                                        ┌─ DEPLOY PATH ──────────────────┐
+                                        │ Developer machine              │
+                                        │  $ npx hot-updater deploy      │
+                                        │  ↳ uses appId from config      │
+                                        │  ↳ uploads to t/{appId}/...    │
+                                        │  ↳ writes Firestore doc w/     │
+                                        │    app_id = tk_acme            │
+                                        └──────────────┬─────────────────┘
+                                                       │
+                                                       ▼
+                                              gs://tile-push-bundles/
+                                              t/{appId}/{bundleId}/
+                                                bundle.zip + assets
+                                                       │
+                                                       │
+┌──────────────────┐                                   │
+│ React Native app │                                   │
+│  HotUpdater.wrap │                                   │
+│  ({appId})       │     READ PATH                     │
+│                  │                                   │
+│ GET /api/check-  │ ─── HTTPS ───▶ ┌──────────────────▼────────────────────┐
+│ update/v2/t/     │                │ Firebase Hosting CDN                  │
+│ {appId}/...      │ ◀── JSON ───── │ (Google edge POPs)                    │
+└────────┬─────────┘                │                                       │
+         │                          │ ✓ cache HIT (~99%): serves from POP   │
+         │                          │ ✗ cache MISS: forwards to origin      │
+         │ download                 └──────────┬────────────────────────────┘
+         │ from public URL                     │ (cache MISS only)
+         │                                     ▼
+         │                          ┌────────────────────────────────────┐
+         │                          │ Cloud Function tile-push           │
+         │                          │ us-central1 (Gen 2 / Cloud Run)    │
+         │                          │                                    │
+         │                          │ 1. Tenant middleware:              │
+         │                          │    extract /t/{appId}/, validate,  │
+         │                          │    strip from path, set ALS ctx    │
+         │                          │ 2. In-memory cache check           │
+         │                          │ 3. Hono → upstream handler         │
+         │                          │ 4. firebaseDatabase plugin reads   │
+         │                          │    currentAppId() from ALS         │
+         │                          │ 5. Firestore query with            │
+         │                          │    .where("app_id", "==", appId)   │
+         │                          └──────────┬─────────────────────────┘
+         │                                     │
+         │                                     ▼
+         │                          ┌────────────────────────────────────┐
+         │                          │ Firestore (named DB: tile-push)    │
+         │                          │  collection: bundles               │
+         │                          │  every doc has app_id field        │
+         │                          │  every composite index has app_id  │
+         │                          │  as first column                   │
+         │                          └────────────────────────────────────┘
+         │
+         ▼
+   gs://tile-push-bundles/t/{appId}/{bundleId}/bundle.zip
+   (public-read, served directly via Google's edge — zero signing latency)
 ```
 
 ## Tech stack
 
 | Layer | Tech | Why this choice |
 |---|---|---|
+| CDN / edge cache | Firebase Hosting (Google's global edge network) | Free for static + function rewrites, same edge POPs as Cloud CDN, no LB cost, auto SSL |
 | Function runtime | Firebase Cloud Functions Gen 2 (which is Cloud Run under the hood) | Auto-scales 0→N, native Firebase integration, GCP credits apply |
 | Web framework | Hono (inside the function) + Express (provided by Google's Functions Framework) | Hono is runtime-portable; Express is what Cloud Functions speaks. A small adapter bridges them. |
-| Database | Firestore Native mode, named database `tile-push` | NoSQL doc store, auto-scales to billions of docs, multi-region option available, GCP credits cover it |
-| Bundle storage | Firebase Cloud Storage (`tile-push-bundles` bucket) | Same project, default IAM, lowest config friction for v1. Will migrate to Cloudflare R2 later. |
+| Tenant context propagation | Node.js `AsyncLocalStorage` | Per-request store visible to deeply nested async code without parameter threading. Upstream code stays untouched. |
+| In-instance cache | Module-level `Map<string, CacheEntry>` with TTL | Zero infra; works across Cloud Run requests on the same warm instance. Cache key is tenant-scoped. |
+| Database | Firestore Native mode, named database `tile-push` | NoSQL doc store, auto-scales to billions of docs, GCP credits cover it. Note: Admin SDK bypasses Security Rules, so tenant isolation is enforced at the plugin layer. |
+| Bundle storage | Firebase Cloud Storage (`tile-push-bundles` bucket, public-read, tenant-prefixed) | Same project, lowest config friction. Public-read removes signBlob bottleneck. Tenant prefix lets us cleanly delete a tenant's data with a single recursive `rm`. Will migrate to Cloudflare R2 later. |
 | Build | `tsdown` (TypeScript bundler using rolldown) | Used by the upstream hot-updater repo; bundles everything except `firebase-functions` + `firebase-admin` |
-| Deploy CLI | `firebase` (firebase-tools) | Standard Firebase deploy tool — handles function provisioning, IAM, indexes |
+| Deploy CLI | `firebase` (firebase-tools) | Standard Firebase deploy tool — handles function provisioning, IAM, indexes, hosting |
 
 ## What's actually running
 
-When a request hits `https://tile-push-io7lmh2oqa-uc.a.run.app/api/check-update/version`, this is the call chain:
+When a request hits `https://apptile-staging-setup.web.app/api/check-update/v2/t/{appId}/fingerprint/...`, this is the call chain:
 
 ```
 [User device]
    │  HTTPS request
    ▼
-[Google's Cloud Run frontend]
-   │  TLS termination, routing
+[Firebase Hosting CDN — Google's edge network]
+   │  TLS termination at nearest POP (e.g. MAA for India)
+   │  Check Cache Rule for /api/check-update/v2/**:
+   │   ├─ HIT  → serve from POP shard (~5ms server time, ~100ms total client)
+   │   └─ MISS → forward to origin                                    ─┐
+                                                                       │
+[Google's Cloud Run frontend] ◀──────────────────────────────────────── ┘
+   │  TLS termination at us-central1
    │
    ▼
 [Container running our bundled index.cjs]
@@ -65,21 +103,33 @@ When a request hits `https://tile-push-io7lmh2oqa-uc.a.run.app/api/check-update/
    │
    ├─ Layer 2: onRequest() adapter (in our code)
    │     Converts Express (req, res) → Web Request
-   │     Calls app.fetch(webRequest)
    │
-   ├─ Layer 3: Hono app router
+   ├─ Layer 2.5: TENANT MIDDLEWARE (in our code) — multi-tenant gate
+   │     Match URL: /api/check-update/v2/t/{appId}/(.+)
+   │     Validate appId format (isValidAppId)
+   │     Strip /t/{appId} from URL
+   │     tenantALS.run({ appId }, async () => { ... rest ... })
+   │
+   ├─ Layer 3: In-memory cache check (in our code)
+   │     Cache key: `${appId}|${url.pathname}`
+   │     HIT  → return cached response (~5ms server time)
+   │     MISS → call app.fetch(request)
+   │
+   ├─ Layer 4: Hono app router
    │     Matches /api/check-update/* → hotUpdater.handler
    │
-   ├─ Layer 4: hot-updater handler (the framework's internal router)
-   │     Matches /version, /fingerprint, /app-version, /api/bundles, etc.
+   ├─ Layer 5: hot-updater handler (upstream — DO NOT MODIFY)
+   │     Matches /v2/fingerprint, /v2/app-version, /version, etc.
    │     Calls business logic
    │
-   └─ Layer 5: firebaseDatabase plugin
-         Issues Firestore queries
-         Generates signed/public storage URLs
+   └─ Layer 6: firebaseDatabase plugin (tenant-aware)
+         Calls currentAppId() — reads from ALS (set in Layer 2.5)
+         Adds .where("app_id", "==", appId) to every Firestore query
+         Verifies returned docs have matching app_id (defense-in-depth)
+         Generates plain (unsigned) storage URLs from doc's storage_uri
 ```
 
-Three concentric routers (Functions Framework → Hono → hot-updater handler) all live in the same container, all run in the same Node process. The layering is what makes the framework portable — if we migrated to Cloudflare Workers, only the outermost layer (Functions Framework / Express) would change.
+Six layers, but only Layers 2.5, 3, and 6 are tile-push-specific — the rest is upstream code untouched. The tenant boundary enforcement lives entirely in Layers 2.5 (middleware) and 6 (plugin guard); upstream Hono and hot-updater handler are completely tenant-agnostic.
 
 ## Data model
 
@@ -87,85 +137,113 @@ Three concentric routers (Functions Framework → Hono → hot-updater handler) 
 
 **Collection: `bundles`**
 
-Each document represents one published bundle.
+Each document represents one published bundle. **Every doc has `app_id`** — the plugin layer enforces this on every write, and queries always filter by it.
 
 ```ts
 // Storage as snake_case fields
 {
   id: "01HXYZ...",                      // ULID-style, time-ordered
+  app_id: "tk_acme-prod",               // REQUIRED — tenant scope
   platform: "ios" | "android",
   channel: "production" | string,
   fingerprint_hash: string,             // hash of native deps for compatibility check
   target_app_version: "1.2.0" | string,
   enabled: boolean,
-  storage_uri: "firebase-storage://tile-push-bundles/...",
+  storage_uri: "firebase-storage://tile-push-bundles/t/{appId}/...",
   file_hash: "sha256:...",
   message: "Fix login crash",
   git_commit_hash: string | null,
   should_force_update: boolean,
-  rollout_count: 1000,                  // 0-1000 (cohort threshold)
+  rollout_cohort_count: 1000,           // 0-1000 (cohort threshold)
   target_cohorts: [],                   // explicit cohort allowlist
-  app_id: null                          // RESERVED for multi-tenancy (no queries use it yet)
   // ... more fields, see packages/core/src/types.ts Bundle interface
 }
 ```
 
 **Collection: `target_app_versions`**
 
-Maintains a fast-lookup table of supported native app versions per (platform, channel). Used by the app-version update strategy.
+Maintains a fast-lookup table of supported native app versions per (appId, platform, channel). Used by the app-version update strategy. Doc IDs are `{appId}_{platform}_{channel}_{targetAppVersion}` to prevent cross-tenant collision.
+
+**Collection: `channels`**
+
+Lists which channels exist per tenant. Doc IDs are `{appId}_{channelName}`. Created/updated as side effects of `commitBundle`.
 
 ### Composite indexes
 
-Defined in `plugins/firebase/firebase/public/firestore.indexes.json`. Seven indexes cover the query patterns the update-check + admin endpoints need. Each is on the `bundles` collection. Most-used:
+Defined in `plugins/firebase/firebase/public/firestore.indexes.json`. Eight indexes cover the query patterns the update-check + admin endpoints need. **Every index begins with `app_id` ASCENDING**, so each tenant's queries scan only their slice.
 
 ```
-(platform, channel, fingerprint_hash, enabled, id DESC)   ← fingerprint strategy
-(platform, channel, target_app_version, enabled, id DESC) ← app-version strategy
-(channel, id DESC)                                         ← admin listing
+(app_id, channel, enabled, platform, fingerprint_hash, id ASC)        ← fingerprint strategy
+(app_id, channel, platform, target_app_version, enabled, id DESC)     ← app-version strategy
+(app_id, channel, id DESC)                                             ← admin listing
+(app_id, channel, platform, id DESC)                                   ← bundle filtering
+(app_id, platform, channel)                                            ← target_app_versions collection
+... 4 more variants for different where-clause combinations
 ```
 
-**For multi-tenancy (planned):** every index needs `app_id` prepended as the first field, e.g. `(app_id, platform, channel, fingerprint_hash, enabled, id DESC)`.
+The `app_id` prefix is what makes the tenant filter free in query cost — Firestore seeks directly to the tenant's segment of the index and scans only there.
 
 ## Storage layout
 
-Bundles live in Firebase Storage at `gs://tile-push-bundles/`. The CLI's deploy command creates a structure like:
+Bundles live in Firebase Storage at `gs://tile-push-bundles/`. **All uploads are tenant-prefixed** by `firebaseStorage.ts` (using `currentAppId(config.appId)` to resolve the prefix).
 
 ```
 gs://tile-push-bundles/
-└── <bundle_id>/
-    ├── bundle.zip                      # the JS bundle (~5 MB typical)
-    ├── manifest.json                   # bundle metadata
-    └── assets/                         # any extracted assets (images, fonts)
+└── t/                                  ← tenant prefix
+    └── {appId}/                        ← e.g. t/tk_acme-prod/
+        └── {bundle_id}/
+            ├── bundle.zip              # the JS bundle (~5 MB typical)
+            ├── manifest.json           # bundle metadata
+            └── files/                  # any extracted assets (images, fonts)
 ```
 
-The `storage_uri` in Firestore points at the bundle.zip. The server generates a download URL (signed or public depending on bucket access mode) when the RN client requests an update.
+The `storage_uri` in Firestore points at the bundle.zip with full tenant-prefixed path. Public-read bucket + plain (unsigned) URL via the `cdnUrl` config option mean the function never calls `signBlob` — bundle URLs are returned directly:
 
-## Request flow: update check by fingerprint
-
-A typical client request:
 ```
-GET /api/check-update/fingerprint/ios/abc123fingerprint/production/00000000-.../00000000-.../427
-                                  │       │              │           │            │       │
-                                  │       │              │           │            │       └─ cohort (1-1000)
-                                  │       │              │           │            └───────── current bundleId (device's)
-                                  │       │              │           └────────────────────── minBundleId (floor for channel switch)
-                                  │       │              └────────────────────────────────── channel
-                                  │       └───────────────────────────────────────────────── fingerprint hash
-                                  └───────────────────────────────────────────────────────── platform
+https://storage.googleapis.com/tile-push-bundles/t/{appId}/{bundleId}/bundle.zip
 ```
 
-Server flow:
-1. Hono routes `/api/check-update/*` to `hotUpdater.handler`
-2. `handleFingerprintUpdateWithCohort` parses URL params
-3. Calls `api.getUpdateInfo({ platform, fingerprintHash, channel, minBundleId, bundleId }, cohort)`
-4. Wrapped via `pluginCore` → calls `firebaseDatabase.getUpdateInfo`
-5. `getUpdateInfo` is built from three sub-methods (see `createDatabasePluginGetUpdateInfo`):
-   - For fingerprint strategy: calls `getBundlesByFingerprint`
-   - That runs a Firestore query: `bundles WHERE platform=? AND channel=? AND enabled=true AND fingerprint_hash=? AND id >= minBundleId`
-6. Returns candidate bundles
-7. `isCohortEligibleForUpdate` filters by cohort (affine permutation, see `packages/core/src/rollout.ts`)
-8. Storage plugin resolves `storage_uri` → public/signed `fileUrl`
-9. JSON response: `{ status: "AVAILABLE" | "UP_TO_DATE" | "ROLLBACK" | null, id, fileUrl, fileHash, ... }`
+Deleting a tenant becomes a single `gsutil rm -r gs://tile-push-bundles/t/{appId}/`.
+
+**Legacy bundles (uploaded before tenant prefix landed)** live at non-prefixed paths but still resolve via their saved `storage_uri`. New uploads always go to the prefixed path.
+
+## Request flow: update check by fingerprint (v2, multi-tenant)
+
+A typical client request (CDN-cacheable, no per-device URL variables):
+```
+GET /api/check-update/v2/t/{appId}/fingerprint/ios/abc123fingerprint/production/00000000-.../00000000-...
+                       │  │  │                  │       │              │           │            │
+                       │  │  │                  │       │              │           │            └─ current bundleId
+                       │  │  │                  │       │              │           └────────────── minBundleId
+                       │  │  │                  │       │              └────────────────────────── channel
+                       │  │  │                  │       └───────────────────────────────────────── fingerprint hash
+                       │  │  │                  └───────────────────────────────────────────────── platform
+                       │  │  └──────────────────────────────────────────────────────────────────── tenant ID (tk_*)
+                       │  └─────────────────────────────────────────────────────────────────────── tenant route segment
+                       └────────────────────────────────────────────────────────────────────────── v2 marker
+```
+
+Cohort is NOT in the URL — it's sent as part of the device's local state. The response returns `eligibleNumericCohorts` per candidate, and the client picks. This is what makes the URL CDN-cacheable.
+
+Server flow (cache MISS path):
+1. Firebase Hosting CDN forwards to Cloud Function (cache MISS only — most are HIT)
+2. **Tenant middleware** parses `/t/{appId}/`, validates format, strips it, opens `tenantALS.run({ appId }, ...)`
+3. In-memory cache check (key `${appId}|${url.pathname}`) — usually MISS on first hit per instance
+4. Hono routes `/api/check-update/*` → `hotUpdater.handler` (upstream, untouched)
+5. `handleFingerprintUpdateV2` parses URL params, calls `api.getAppUpdateCandidates(...)`
+6. `pluginCore` calls `firebaseDatabase.getAppUpdateCandidates` (or `getBundlesByFingerprint` depending on the route)
+7. Plugin reads `appId = currentAppId(configAppId)` from ALS
+8. Firestore query: `bundles WHERE app_id=? AND platform=? AND channel=? AND enabled=true AND fingerprint_hash=? AND id >= minBundleId`
+9. `convertToBundle` verifies returned doc's `app_id` matches — throws on mismatch (defense-in-depth)
+10. For each candidate, compute `eligibleNumericCohorts` via `getRolledOutNumericCohorts(bundleId, rolloutCohortCount)`
+11. Storage plugin resolves `storage_uri` → public `fileUrl` via `cdnUrl` config (no signBlob)
+12. JSON response: `{ candidates: [{ id, status, fileUrl, eligibleNumericCohorts, targetCohorts, ... }] }`
+13. Response cached in instance Map (60s TTL); also cached at Hosting CDN edge (60s TTL via Cache-Control header)
+
+Client-side completion:
+14. Client receives candidates, calls `getCohort()` to get device's persistent cohort
+15. Client `.find()`s the candidate whose `eligibleNumericCohorts` contains the device's cohort
+16. If `picked.id !== currentBundleId`, SDK downloads `picked.fileUrl` and installs
 
 ## Build pipeline
 
@@ -234,28 +312,37 @@ Live function at https://tile-push-io7lmh2oqa-uc.a.run.app
 
 | Identity | Permissions | Purpose |
 |---|---|---|
-| `tile-push` Cloud Run service's runtime SA | Project Editor (default) | Reads/writes Firestore, reads/writes Storage |
-| `allUsers` (public) | `run.invoker` on the `tile-push` service | Lets the RN client hit the function without auth (anyone can call) |
+| `tile-push` Cloud Run service's runtime SA | Project Editor (default) | Reads/writes Firestore (`tile-push` DB), reads/writes Storage (`tile-push-bundles`) |
+| `allUsers` (public) | `run.invoker` on the `tile-push` Cloud Run service | Lets the RN client hit the function without auth |
+| `allUsers` (public) | `storage.objectViewer` on `gs://tile-push-bundles` | Allows direct bundle downloads without signed URLs (skips signBlob bottleneck) |
+| Firebase Hosting service | (managed by Google) | Forwards requests to the Cloud Function via firebase.json rewrites |
 | Developer (you) | Project IAM permissions | Deploy via firebase CLI |
 
-**Note on public access:** The function's `allUsers → run.invoker` binding is what makes update-check public. When multi-tenancy lands, we'll add API key auth in middleware, but the function itself stays public to the world (with the gate in code).
+**Note on public access:**
+- The function's `allUsers → run.invoker` makes update-check publicly callable. Tenant boundary is enforced inside the function (Layer 2.5 middleware + Layer 6 plugin).
+- The bucket's public-read removes signBlob latency. Bundle integrity is verified via the `file_hash` field in the response; URL secrecy is NOT a security mechanism.
+- Future: per-tenant API key auth for write endpoints (deploys, bundle management). Read endpoints (check-update) stay public.
 
-## Cost model (current, no CDN, no multi-tenancy yet)
+## Cost model
 
-At expected scale of 1M DAU across many tenants (when multi-tenancy ships), brute-force pricing:
+Numbers at 1M DAU across many tenants assuming v2 CDN-cacheable URLs (current architecture):
 
 | Item | Volume/month | Cost |
 |---|---|---|
-| Cloud Function invocations | ~120M (no CDN) → drops to ~18M with CDN | ~$25–50 |
-| Firestore reads | 240M (no CDN) → 36M with CDN | ~$22–150 |
+| Cloud Function invocations (1% MISS rate at edge) | ~1.2M | ~$1–2 |
+| Firestore reads (with in-instance Map cache halving misses) | ~3M | ~$1–2 |
 | Firestore writes (deploys) | ~30k | <$1 |
-| Firestore storage | 2-5 GB | $1 |
-| Firebase Storage at rest | 5 TB | $100 |
-| Firebase Storage egress (no CDN) | 21 TB | ~$1,500 ← biggest line item |
-| Total (no CDN, no R2) | | ~$1,650/mo at 1M DAU |
-| Total with CDN + R2 migration | | ~$200/mo at 1M DAU |
+| Firestore storage | 2–5 GB | $1 |
+| Firebase Storage at rest | ~5 TB | $100 |
+| Firebase Storage egress (CDN absorbs ~99%) | ~210 GB cache fill + minor | ~$30 |
+| Firebase Hosting bandwidth (~600 GB shipped from edge) | ~600 GB | ~$90 |
+| Total at 1M DAU (current architecture) | | **~$225/mo** |
 
-The bundle egress is what dominates. Migrating to Cloudflare R2 ($0 egress) cuts the bill ~88%. See roadmap.
+Optimization phases left:
+- Migrate bundle storage to Cloudflare R2 (zero egress): drops storage egress + Hosting bandwidth from ~$120 to ~$0. **Total goes to ~$135/mo.**
+- Cloudflare Workers fronting (replaces Hosting): trades $90 Hosting bandwidth for ~$30 Workers invocations. **Total goes to ~$165/mo.** Probably skip unless egress-pricing-economics requires it.
+
+See `LATENCY_ANALYSIS.md` for cost projections at higher scales (10M, 100M, 1B DAU).
 
 ## Why named Firestore database (`tile-push` not `(default)`)
 
