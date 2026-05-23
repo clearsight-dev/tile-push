@@ -162,7 +162,7 @@ From the deploy directory:
 ```bash
 cd plugins/firebase/deploy
 firebase deploy \
-    --only functions,firestore:indexes \
+    --only functions:tile-push,firestore:indexes,hosting \
     --project apptile-staging-setup \
     --non-interactive \
     --force
@@ -170,9 +170,58 @@ firebase deploy \
 
 Expected duration: 3-5 minutes.
 
+**Always include `hosting` in `--only` when you re-deploy functions.** See [pinTag gotcha](#-pintag-gotcha--always-redeploy-hosting-alongside-functions) below.
+
 What this deploys:
 - **Firestore indexes** for `bundles` collection on the `tile-push` named database (NOT `(default)`)
 - **Cloud Function** `tile-push` (Gen 2) in us-central1, listening at `https://tile-push-<hash>-uc.a.run.app`
+- **Hosting** rewrites + cache rules + Cache-Control header injection for `/api/check-update/v2/**`
+
+## ⚠ pinTag gotcha — always redeploy Hosting alongside functions
+
+`plugins/firebase/firebase/public/firebase.json` sets `pinTag: true` on the Hosting rewrite to the Cloud Function:
+
+```json
+{
+  "hosting": {
+    "rewrites": [{
+      "source": "/api/**",
+      "function": { "functionId": "tile-push", "region": "us-central1", "pinTag": true }
+    }]
+  }
+}
+```
+
+This pins Hosting traffic to a **specific Cloud Run revision tag**. Useful for blue-green deploys, but has a sharp edge:
+
+**If you deploy ONLY the function, Hosting won't see the new code.** A new Cloud Run revision is created but Hosting keeps routing to whichever revision the pin was set to last.
+
+| Command | Function deployed | Hosting pin refreshed | Result |
+|---|---|---|---|
+| `firebase deploy --only functions:tile-push` | Yes | **No** | New code exists but Hosting serves old revision |
+| `firebase deploy --only hosting` | No | Yes (to old revision) | Same as before |
+| `firebase deploy --only functions:tile-push,hosting` | Yes | **Yes** (to new revision) | ✓ correct |
+| `firebase deploy` (no `--only`) | Yes | Yes | ✓ correct, deploys everything |
+
+**Rule of thumb**: when redeploying the function, **always** include hosting in `--only` (or omit `--only` entirely).
+
+How to tell you've been bitten by this:
+- `curl https://tile-push-io7lmh2oqa-uc.a.run.app/api/check-update/v2/...` returns NEW response shape ✓
+- `curl https://apptile-staging-setup.web.app/api/check-update/v2/...` returns OLD response shape ✗
+- Direct origin works, Hosting doesn't → pin wasn't refreshed → run `firebase deploy --only hosting` to fix
+
+How to verify the pin is fresh after deploy:
+```bash
+# Both URLs should return the same response shape:
+curl -sS "https://tile-push-io7lmh2oqa-uc.a.run.app/api/check-update/v2/t/tk_test/fingerprint/android/test/production/00000000-0000-0000-0000-000000000000/00000000-0000-0000-0000-000000000000" | python3 -c "import json,sys; print(len(json.load(sys.stdin)['candidates']))"
+curl -sS "https://apptile-staging-setup.web.app/api/check-update/v2/t/tk_test/fingerprint/android/test/production/00000000-0000-0000-0000-000000000000/00000000-0000-0000-0000-000000000000" | python3 -c "import json,sys; print(len(json.load(sys.stdin)['candidates']))"
+# Counts should match.
+```
+
+If counts differ, Hosting still has the old pin. Force a re-pin:
+```bash
+firebase deploy --only hosting --project apptile-staging-setup
+```
 
 Look for these lines in the output (success indicators):
 ```
