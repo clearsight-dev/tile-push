@@ -8,6 +8,11 @@ import { pickEligibleCandidate, type V2Candidate } from "./picker";
 
 const NIL_UUID = "00000000-0000-0000-0000-000000000000";
 
+/** Always-eligible numeric rollout (mirrors server's normalized 100%). */
+const FULL_ROLLOUT = 1000;
+/** No numeric rollout (no device cohort 1..1000 matches). */
+const NO_ROLLOUT = 0;
+
 /**
  * Build a fake candidate with sensible defaults. Override anything via
  * the partial argument.
@@ -18,22 +23,16 @@ function candidate(overrides: Partial<V2Candidate> = {}): V2Candidate {
     status: "UPDATE",
     fileUrl: "https://example.com/bundle.zip",
     fileHash: "deadbeef",
-    eligibleNumericCohorts: range(1, 1000),
+    rolloutCohortCount: FULL_ROLLOUT,
     targetCohorts: [],
     ...overrides,
   };
 }
 
-function range(from: number, to: number): number[] {
-  const out: number[] = [];
-  for (let i = from; i <= to; i++) out.push(i);
-  return out;
-}
-
 /** Helper: a server response shape that the smart-bounded server emits. */
 function serverBuildsCandidatesFor(args: {
   /** All enabled bundles in DB, DESC by id (newest first). */
-  bundles: Array<{ id: string; rolloutEligible?: number[] }>;
+  bundles: Array<{ id: string; rolloutCohortCount?: number }>;
   /** Device's currentBundleId (or NIL_UUID for fresh installs). */
   currentBundleId: string;
 }): V2Candidate[] {
@@ -46,7 +45,7 @@ function serverBuildsCandidatesFor(args: {
         candidate({
           id: b.id,
           status: "UPDATE",
-          eligibleNumericCohorts: b.rolloutEligible ?? range(1, 1000),
+          rolloutCohortCount: b.rolloutCohortCount ?? FULL_ROLLOUT,
         }),
       );
       continue;
@@ -57,7 +56,7 @@ function serverBuildsCandidatesFor(args: {
         candidate({
           id: b.id,
           status: "UPDATE",
-          eligibleNumericCohorts: b.rolloutEligible ?? range(1, 1000),
+          rolloutCohortCount: b.rolloutCohortCount ?? FULL_ROLLOUT,
         }),
       );
       continue;
@@ -67,7 +66,7 @@ function serverBuildsCandidatesFor(args: {
       candidate({
         id: b.id,
         status: "ROLLBACK",
-        eligibleNumericCohorts: range(1, 1000),
+        rolloutCohortCount: FULL_ROLLOUT,
       }),
     );
     break;
@@ -81,7 +80,7 @@ function serverBuildsCandidatesFor(args: {
         status: "ROLLBACK",
         fileUrl: null,
         fileHash: null,
-        eligibleNumericCohorts: range(1, 1000),
+        rolloutCohortCount: FULL_ROLLOUT,
       }),
     );
   }
@@ -97,10 +96,10 @@ describe("pickEligibleCandidate — pure picker logic", () => {
   // ─── Scenario 1: Newer eligible exists ───────────────────────────────
   it("S1: returns the newest cohort-eligible upgrade when one exists", () => {
     const candidates = [
-      candidate({ id: "B7", eligibleNumericCohorts: [1, 2, 3] }), // not eligible for 500
-      candidate({ id: "B6", eligibleNumericCohorts: range(1, 1000) }), // eligible
+      candidate({ id: "B7", rolloutCohortCount: NO_ROLLOUT }), // not eligible for 500
+      candidate({ id: "B6", rolloutCohortCount: FULL_ROLLOUT }), // eligible
       candidate({ id: "B5", status: "UPDATE" }), // current
-      candidate({ id: "B4", status: "ROLLBACK", eligibleNumericCohorts: range(1, 1000) }),
+      candidate({ id: "B4", status: "ROLLBACK", rolloutCohortCount: FULL_ROLLOUT }),
     ];
     const picked = pickEligibleCandidate(candidates, "500");
     expect(picked?.id).toBe("B6");
@@ -110,10 +109,10 @@ describe("pickEligibleCandidate — pure picker logic", () => {
   // ─── Scenario 2: Newer not eligible, current eligible (returns current) ───
   it("S2: returns the current bundle when newer ones aren't eligible — caller treats it as up-to-date", () => {
     const candidates = [
-      candidate({ id: "B7", eligibleNumericCohorts: [1, 2, 3] }), // not eligible for 500
-      candidate({ id: "B6", eligibleNumericCohorts: [4, 5, 6] }), // not eligible
-      candidate({ id: "B5", eligibleNumericCohorts: range(1, 1000) }), // current — eligible
-      candidate({ id: "B4", status: "ROLLBACK", eligibleNumericCohorts: range(1, 1000) }),
+      candidate({ id: "B7", rolloutCohortCount: NO_ROLLOUT }), // not eligible for 500
+      candidate({ id: "B6", rolloutCohortCount: NO_ROLLOUT }), // not eligible
+      candidate({ id: "B5", rolloutCohortCount: FULL_ROLLOUT }), // current — eligible
+      candidate({ id: "B4", status: "ROLLBACK", rolloutCohortCount: FULL_ROLLOUT }),
     ];
     const picked = pickEligibleCandidate(candidates, "500");
     expect(picked?.id).toBe("B5"); // picker returns current; resolver's id==bundleId check converts to null
@@ -122,10 +121,10 @@ describe("pickEligibleCandidate — pure picker logic", () => {
   // ─── Scenario 3: Newer not eligible, current not eligible → rollback ───
   it("S3: falls through to ROLLBACK candidate when neither newer nor current is eligible", () => {
     const candidates = [
-      candidate({ id: "B7", eligibleNumericCohorts: [1, 2, 3] }),
-      candidate({ id: "B6", eligibleNumericCohorts: [4, 5, 6] }),
-      candidate({ id: "B5", eligibleNumericCohorts: [7, 8, 9] }), // current also not eligible
-      candidate({ id: "B4", status: "ROLLBACK", eligibleNumericCohorts: range(1, 1000) }),
+      candidate({ id: "B7", rolloutCohortCount: NO_ROLLOUT }),
+      candidate({ id: "B6", rolloutCohortCount: NO_ROLLOUT }),
+      candidate({ id: "B5", rolloutCohortCount: NO_ROLLOUT }), // current also not eligible
+      candidate({ id: "B4", status: "ROLLBACK", rolloutCohortCount: FULL_ROLLOUT }),
     ];
     const picked = pickEligibleCandidate(candidates, "500");
     expect(picked?.id).toBe("B4");
@@ -136,10 +135,10 @@ describe("pickEligibleCandidate — pure picker logic", () => {
   it("S4: rollback fires when current bundle is missing from candidates (disabled)", () => {
     // Server emits no UP_TO_DATE for current — it's just not in the list
     const candidates = [
-      candidate({ id: "B7", eligibleNumericCohorts: [1, 2, 3] }),
-      candidate({ id: "B6", eligibleNumericCohorts: [4, 5, 6] }),
+      candidate({ id: "B7", rolloutCohortCount: NO_ROLLOUT }),
+      candidate({ id: "B6", rolloutCohortCount: NO_ROLLOUT }),
       // B5 (current) is absent because it was disabled by admin
-      candidate({ id: "B4", status: "ROLLBACK", eligibleNumericCohorts: range(1, 1000) }),
+      candidate({ id: "B4", status: "ROLLBACK", rolloutCohortCount: FULL_ROLLOUT }),
     ];
     const picked = pickEligibleCandidate(candidates, "500");
     expect(picked?.id).toBe("B4");
@@ -149,14 +148,14 @@ describe("pickEligibleCandidate — pure picker logic", () => {
   // ─── Scenario 5: Nothing eligible, no older bundle exists ───
   it("S5: falls through to INIT_ROLLBACK synthetic when nothing else matches", () => {
     const candidates = [
-      candidate({ id: "B7", eligibleNumericCohorts: [1, 2, 3] }),
-      candidate({ id: "B6", eligibleNumericCohorts: [4, 5, 6] }),
+      candidate({ id: "B7", rolloutCohortCount: NO_ROLLOUT }),
+      candidate({ id: "B6", rolloutCohortCount: NO_ROLLOUT }),
       candidate({
         id: NIL_UUID,
         status: "ROLLBACK",
         fileUrl: null,
         fileHash: null,
-        eligibleNumericCohorts: range(1, 1000),
+        rolloutCohortCount: FULL_ROLLOUT,
       }),
     ];
     const picked = pickEligibleCandidate(candidates, "500");
@@ -167,9 +166,9 @@ describe("pickEligibleCandidate — pure picker logic", () => {
   // ─── Scenario 6: Fresh install, newer eligible exists ───
   it("S6: fresh install picks the newest eligible UPDATE", () => {
     const candidates = [
-      candidate({ id: "B7", eligibleNumericCohorts: range(1, 1000) }),
-      candidate({ id: "B6", eligibleNumericCohorts: range(1, 1000) }),
-      candidate({ id: "B5", eligibleNumericCohorts: range(1, 1000) }),
+      candidate({ id: "B7", rolloutCohortCount: FULL_ROLLOUT }),
+      candidate({ id: "B6", rolloutCohortCount: FULL_ROLLOUT }),
+      candidate({ id: "B5", rolloutCohortCount: FULL_ROLLOUT }),
       // Note: no INIT_ROLLBACK because currentBundleId is NIL — server gates it
     ];
     const picked = pickEligibleCandidate(candidates, "500");
@@ -179,8 +178,8 @@ describe("pickEligibleCandidate — pure picker logic", () => {
   // ─── Scenario 7: Fresh install, nothing eligible (no INIT_ROLLBACK) ───
   it("S7: fresh install returns null when nothing matches and no init-rollback emitted", () => {
     const candidates = [
-      candidate({ id: "B7", eligibleNumericCohorts: [1, 2, 3] }),
-      candidate({ id: "B6", eligibleNumericCohorts: [4, 5, 6] }),
+      candidate({ id: "B7", rolloutCohortCount: NO_ROLLOUT }),
+      candidate({ id: "B6", rolloutCohortCount: NO_ROLLOUT }),
       // No INIT_ROLLBACK candidate in the list for fresh installs
     ];
     const picked = pickEligibleCandidate(candidates, "500");
@@ -193,11 +192,11 @@ describe("pickEligibleCandidate — pure picker logic", () => {
     // below the floor. Server filters out the old bundle and doesn't emit
     // INIT_ROLLBACK either (mirroring v1's `currentBundleId <= minBundleId → null`).
     const candidates = [
-      candidate({ id: "B7", eligibleNumericCohorts: [1, 2, 3] }),
-      candidate({ id: "B6", eligibleNumericCohorts: [4, 5, 6] }),
-      candidate({ id: "B5", eligibleNumericCohorts: [7, 8, 9] }),
-      candidate({ id: "B4", eligibleNumericCohorts: [10, 11, 12] }),
-      candidate({ id: "B3", eligibleNumericCohorts: [13, 14, 15] }),
+      candidate({ id: "B7", rolloutCohortCount: NO_ROLLOUT }),
+      candidate({ id: "B6", rolloutCohortCount: NO_ROLLOUT }),
+      candidate({ id: "B5", rolloutCohortCount: NO_ROLLOUT }),
+      candidate({ id: "B4", rolloutCohortCount: NO_ROLLOUT }),
+      candidate({ id: "B3", rolloutCohortCount: NO_ROLLOUT }),
       // No INIT_ROLLBACK emitted because v1 wouldn't either
     ];
     const picked = pickEligibleCandidate(candidates, "500");
@@ -214,13 +213,13 @@ describe("pickEligibleCandidate — pure picker logic", () => {
   // ─── Scenario 10: Single bundle, on it, eligible ───
   it("S10: returns the single eligible bundle (caller's id check converts to null)", () => {
     const candidates = [
-      candidate({ id: "B5", eligibleNumericCohorts: range(1, 1000) }),
+      candidate({ id: "B5", rolloutCohortCount: FULL_ROLLOUT }),
       candidate({
         id: NIL_UUID,
         status: "ROLLBACK",
         fileUrl: null,
         fileHash: null,
-        eligibleNumericCohorts: range(1, 1000),
+        rolloutCohortCount: FULL_ROLLOUT,
       }),
     ];
     const picked = pickEligibleCandidate(candidates, "500");
@@ -230,13 +229,13 @@ describe("pickEligibleCandidate — pure picker logic", () => {
   // ─── Scenario 11: Single bundle, on it, not eligible ───
   it("S11: falls through to INIT_ROLLBACK when the only candidate is not eligible", () => {
     const candidates = [
-      candidate({ id: "B5", eligibleNumericCohorts: [1, 2, 3] }), // not eligible
+      candidate({ id: "B5", rolloutCohortCount: NO_ROLLOUT }), // not eligible
       candidate({
         id: NIL_UUID,
         status: "ROLLBACK",
         fileUrl: null,
         fileHash: null,
-        eligibleNumericCohorts: range(1, 1000),
+        rolloutCohortCount: FULL_ROLLOUT,
       }),
     ];
     const picked = pickEligibleCandidate(candidates, "500");
@@ -249,19 +248,19 @@ describe("pickEligibleCandidate — pure picker logic", () => {
       candidate({
         id: "B6",
         shouldForceUpdate: true,
-        eligibleNumericCohorts: range(1, 1000),
+        rolloutCohortCount: FULL_ROLLOUT,
       }),
     ];
     const picked = pickEligibleCandidate(candidates, "500");
     expect(picked?.shouldForceUpdate).toBe(true);
   });
 
-  // ─── Scenario 13: Multiple rollouts with overlapping cohorts ───
+  // ─── Scenario 13: Multiple eligible bundles ───
   it("S13: prefers the newest bundle when multiple are cohort-eligible", () => {
     const candidates = [
-      candidate({ id: "B7", eligibleNumericCohorts: [100, 500, 999] }),
-      candidate({ id: "B6", eligibleNumericCohorts: range(1, 1000) }), // also eligible
-      candidate({ id: "B5", eligibleNumericCohorts: range(1, 1000) }), // also eligible
+      candidate({ id: "B7", rolloutCohortCount: FULL_ROLLOUT }),
+      candidate({ id: "B6", rolloutCohortCount: FULL_ROLLOUT }), // also eligible
+      candidate({ id: "B5", rolloutCohortCount: FULL_ROLLOUT }), // also eligible
     ];
     const picked = pickEligibleCandidate(candidates, "500");
     expect(picked?.id).toBe("B7"); // first in list wins
@@ -272,7 +271,7 @@ describe("pickEligibleCandidate — pure picker logic", () => {
     const candidates = [
       candidate({
         id: "B7",
-        eligibleNumericCohorts: [],
+        rolloutCohortCount: NO_ROLLOUT,
         targetCohorts: ["beta-team"],
       }),
     ];
@@ -280,13 +279,13 @@ describe("pickEligibleCandidate — pure picker logic", () => {
     expect(picked?.id).toBe("B7");
   });
 
-  // ─── Scenario 15: Custom + numeric metadata combined ───
-  it("S15: matches numeric cohort even when targetCohorts also present", () => {
+  // ─── Scenario 15: targetCohorts works for both numeric strings and custom slugs ───
+  it("S15: targetCohorts handles numeric strings and custom slugs together", () => {
     const candidates = [
       candidate({
         id: "B7",
-        eligibleNumericCohorts: [500],
-        targetCohorts: ["beta-team"],
+        rolloutCohortCount: NO_ROLLOUT,
+        targetCohorts: ["500", "beta-team"],
       }),
     ];
     expect(pickEligibleCandidate(candidates, "500")?.id).toBe("B7");
@@ -301,7 +300,7 @@ describe("pickEligibleCandidate — pure picker logic", () => {
       status: "UPDATE",
       fileUrl: "https://example.com/x.zip",
       fileHash: "abc",
-      // no eligibleNumericCohorts, no targetCohorts
+      // no rolloutCohortCount, no targetCohorts
     };
     expect(pickEligibleCandidate([noMetadata], "500")?.id).toBe("B7");
     expect(pickEligibleCandidate([noMetadata], "any-cohort")?.id).toBe("B7");
@@ -313,10 +312,10 @@ describe("pickEligibleCandidate — pure picker logic", () => {
   it("S17: stops at first eligible candidate — later candidates ignored even if also eligible", () => {
     const second = candidate({
       id: "B6",
-      eligibleNumericCohorts: range(1, 1000),
+      rolloutCohortCount: FULL_ROLLOUT,
     });
     const candidates = [
-      candidate({ id: "B7", eligibleNumericCohorts: range(1, 1000) }),
+      candidate({ id: "B7", rolloutCohortCount: FULL_ROLLOUT }),
       second,
     ];
     const picked = pickEligibleCandidate(candidates, "500");
@@ -332,23 +331,20 @@ describe("pickEligibleCandidate — pure picker logic", () => {
 describe("pickEligibleCandidate — edge cases", () => {
   it("returns null when cohort is null and no always-eligible candidate exists", () => {
     const candidates = [
-      candidate({ id: "B7", eligibleNumericCohorts: [500], targetCohorts: [] }),
+      candidate({ id: "B7", rolloutCohortCount: 1, targetCohorts: [] }),
     ];
     expect(pickEligibleCandidate(candidates, null)).toBeNull();
   });
 
-  it("picks ROLLBACK candidate when cohort is null because ROLLBACK is always-eligible", () => {
+  it("returns null when cohort is null even if ROLLBACK has 100% rollout — null never matches numeric eligibility", () => {
     const candidates = [
-      candidate({ id: "B7", eligibleNumericCohorts: [500] }), // not eligible for null cohort
+      candidate({ id: "B7", rolloutCohortCount: NO_ROLLOUT }),
       candidate({
         id: "B6",
         status: "ROLLBACK",
-        eligibleNumericCohorts: range(1, 1000),
+        rolloutCohortCount: FULL_ROLLOUT,
       }),
     ];
-    // null cohort can't match numeric eligibility, but ROLLBACK has all cohorts
-    // — yet "null cohort" doesn't have a numeric value, so it can't match
-    // either. The picker returns null in this edge case.
     expect(pickEligibleCandidate(candidates, null)).toBeNull();
   });
 
@@ -356,7 +352,7 @@ describe("pickEligibleCandidate — edge cases", () => {
     const candidates = [
       candidate({
         id: "B7",
-        eligibleNumericCohorts: [500], // includes 500 but cohort is "beta-team"
+        rolloutCohortCount: FULL_ROLLOUT, // 500 would match, but cohort is "beta-team"
         targetCohorts: ["beta-team"],
       }),
     ];
@@ -367,7 +363,7 @@ describe("pickEligibleCandidate — edge cases", () => {
     const candidates = [
       candidate({
         id: "B7",
-        eligibleNumericCohorts: [100, 200, 300],
+        rolloutCohortCount: NO_ROLLOUT,
         targetCohorts: ["beta-team"],
       }),
     ];
@@ -380,7 +376,7 @@ describe("pickEligibleCandidate — edge cases", () => {
       candidate({
         id: "B4",
         status: "ROLLBACK",
-        eligibleNumericCohorts: range(1, 1000),
+        rolloutCohortCount: FULL_ROLLOUT,
       }),
     ];
     const picked = pickEligibleCandidate(candidates, "500");
@@ -394,7 +390,7 @@ describe("pickEligibleCandidate — edge cases", () => {
         status: "ROLLBACK",
         fileUrl: null,
         fileHash: null,
-        eligibleNumericCohorts: range(1, 1000),
+        rolloutCohortCount: FULL_ROLLOUT,
       }),
     ];
     const picked = pickEligibleCandidate(candidates, "500");
@@ -409,11 +405,11 @@ describe("pickEligibleCandidate — edge cases", () => {
 // ─────────────────────────────────────────────────────────────────────────
 
 describe("end-to-end scenarios — server emits the curated list, picker selects", () => {
-  it("rollout match: device sees upgrade in eligible cohort set", () => {
+  it("rollout match: device sees upgrade when eligible", () => {
     const candidates = serverBuildsCandidatesFor({
       bundles: [
-        { id: "B7", rolloutEligible: [100, 200, 300] }, // 10% rollout, doesn't include 500
-        { id: "B6", rolloutEligible: [500, 501, 502] }, // includes 500
+        { id: "B7", rolloutCohortCount: NO_ROLLOUT }, // not eligible
+        { id: "B6", rolloutCohortCount: FULL_ROLLOUT }, // eligible
         { id: "B5" }, // 100% (current)
         { id: "B4" }, // 100% (older)
       ],
@@ -424,10 +420,10 @@ describe("end-to-end scenarios — server emits the curated list, picker selects
     expect(picked?.status).toBe("UPDATE");
   });
 
-  it("skip path: no upgrade in eligible cohort set, current still eligible → up-to-date", () => {
+  it("skip path: no upgrade eligible, current still eligible → up-to-date", () => {
     const candidates = serverBuildsCandidatesFor({
       bundles: [
-        { id: "B7", rolloutEligible: [100, 200, 300] }, // doesn't include 500
+        { id: "B7", rolloutCohortCount: NO_ROLLOUT }, // not eligible
         { id: "B5" }, // current, eligible
         { id: "B4" }, // older
       ],
@@ -440,7 +436,7 @@ describe("end-to-end scenarios — server emits the curated list, picker selects
   it("rollback path: current bundle was disabled, picker finds older eligible", () => {
     const candidates = serverBuildsCandidatesFor({
       bundles: [
-        { id: "B7", rolloutEligible: [100, 200, 300] }, // not eligible
+        { id: "B7", rolloutCohortCount: NO_ROLLOUT }, // not eligible
         // B5 missing — disabled by admin
         { id: "B4" }, // becomes the ROLLBACK target
       ],
@@ -454,8 +450,8 @@ describe("end-to-end scenarios — server emits the curated list, picker selects
   it("rollback to native (init-rollback): all candidates ineligible", () => {
     const candidates = serverBuildsCandidatesFor({
       bundles: [
-        { id: "B7", rolloutEligible: [100] },
-        { id: "B6", rolloutEligible: [200] },
+        { id: "B7", rolloutCohortCount: NO_ROLLOUT },
+        { id: "B6", rolloutCohortCount: NO_ROLLOUT },
       ],
       currentBundleId: "B5",
     });
@@ -482,7 +478,7 @@ describe("end-to-end scenarios — server emits the curated list, picker selects
 
   it("fresh install + nothing eligible: returns null (no init-rollback emitted)", () => {
     const candidates = serverBuildsCandidatesFor({
-      bundles: [{ id: "B7", rolloutEligible: [100, 200] }],
+      bundles: [{ id: "B7", rolloutCohortCount: NO_ROLLOUT }],
       currentBundleId: NIL_UUID,
     });
     expect(pickEligibleCandidate(candidates, "500")).toBeNull();
