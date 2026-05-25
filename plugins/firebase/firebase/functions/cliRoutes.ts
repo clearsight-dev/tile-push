@@ -5,6 +5,75 @@ import { Hono } from "hono";
 import { firebaseDatabase } from "../../src/firebaseDatabase";
 import { cliAuthMiddleware, getCliAuth } from "./cliAuth";
 
+// -----------------------------------------------------------------------------
+// Cloud CDN cache invalidation on deploy
+//
+// After a successful bundle commit we call urlMaps.invalidateCache scoped to
+// the tenant's check-update prefix. Cache TTL is 30 days; explicit
+// invalidation is what gives us instant rollout while still serving the rest
+// of the time from edge.
+//
+// Failure here must NOT fail the deploy — the bundle is already in Firestore
+// at this point. Worst case the cache serves stale for up to s-maxage, which
+// is bounded recovery, not a correctness failure.
+//
+// We pull the access token from the GCE metadata server rather than pulling
+// in google-auth-library — Cloud Run instances always have metadata available,
+// and the service account's default scopes already cover the Compute API
+// (roles/editor → compute.urlMaps.invalidateCache).
+// -----------------------------------------------------------------------------
+const PROJECT_ID = process.env.GCLOUD_PROJECT ?? "apptile-staging-setup";
+const URL_MAP_NAME = process.env.HOT_UPDATER_URL_MAP ?? "tile-push-lb";
+
+async function getMetadataAccessToken(): Promise<string> {
+  const response = await fetch(
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+    { headers: { "Metadata-Flavor": "Google" } },
+  );
+  if (!response.ok) {
+    throw new Error(
+      `metadata server returned ${response.status}: ${await response.text()}`,
+    );
+  }
+  const data = (await response.json()) as { access_token: string };
+  return data.access_token;
+}
+
+async function invalidateTenantCache(appId: string): Promise<void> {
+  try {
+    const token = await getMetadataAccessToken();
+    const response = await fetch(
+      `https://compute.googleapis.com/compute/v1/projects/${PROJECT_ID}/global/urlMaps/${URL_MAP_NAME}/invalidateCache`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          path: `/api/check-update/v2/t/${appId}/*`,
+        }),
+      },
+    );
+    if (!response.ok) {
+      const text = await response.text();
+      console.error(
+        `[cdn] invalidation failed for ${appId}: HTTP ${response.status} ${text}`,
+      );
+      return;
+    }
+    const data = (await response.json()) as { name?: string; status?: string };
+    console.log(
+      `[cdn] invalidated /api/check-update/v2/t/${appId}/* op=${data.name} status=${data.status}`,
+    );
+  } catch (err) {
+    console.error(
+      `[cdn] invalidation error for ${appId}:`,
+      (err as Error).message,
+    );
+  }
+}
+
 /**
  * CLI routes for tile-push deploys. Mounted at /api/cli on the outer Hono
  * app. Every route under /t/:appId/* runs the cliAuthMiddleware, which:
@@ -28,6 +97,10 @@ import { cliAuthMiddleware, getCliAuth } from "./cliAuth";
 
 const STORAGE_BUCKET = "tile-push-bundles";
 const UPLOAD_URL_TTL_MS = 60 * 60 * 1000; // 1h
+// Download URLs are used by the deploy-time patch generator to pull previous
+// bundle bytes for hdiff. Deploy fetches immediately; no reason to grant a
+// long replay window.
+const DOWNLOAD_URL_TTL_MS = 5 * 60 * 1000; // 5m
 const MAX_UPLOAD_SIZE_BYTES = 100 * 1024 * 1024; // 100MB cap
 
 // firebaseDatabase is double-curried: (config) => (() => DatabasePlugin).
@@ -91,6 +164,12 @@ cliApp.post("/t/:appId/upload-url", async (c) => {
   const contentType = body.contentType ?? "application/octet-stream";
   const scopedKey = `t/${auth.appId}/${key}`;
 
+  // Bundle artifacts are content-addressed (bundle ID is a UUIDv7, the URL
+  // never serves different bytes for the same path), so we set them
+  // immutable for a year on the object itself. Cloud CDN reads this header
+  // and caches at the edge forever; browsers/devices skip revalidation.
+  const cacheControl = "public, max-age=31536000, immutable";
+
   const bucket = admin.storage().bucket(STORAGE_BUCKET);
   const file = bucket.file(scopedKey);
 
@@ -101,6 +180,7 @@ cliApp.post("/t/:appId/upload-url", async (c) => {
     contentType,
     extensionHeaders: {
       "x-goog-content-length-range": `0,${MAX_UPLOAD_SIZE_BYTES}`,
+      "Cache-Control": cacheControl,
     },
   });
 
@@ -110,8 +190,61 @@ cliApp.post("/t/:appId/upload-url", async (c) => {
     requiredHeaders: {
       "Content-Type": contentType,
       "x-goog-content-length-range": `0,${MAX_UPLOAD_SIZE_BYTES}`,
+      "Cache-Control": cacheControl,
     },
   });
+});
+
+// -----------------------------------------------------------------------------
+// GET /t/:appId/storage/download-url?uri=gs://... — signed GCS GET URL
+//
+// Used by the deploy-time patch generator: hot-updater's createBundleDiff
+// downloads previous bundle bytes (manifests + .bundle files) on the deploy
+// machine, runs hdiff WASM locally, and uploads the resulting .bsdiff patch
+// via the existing upload-url flow.
+//
+// Security: the `uri` MUST start with gs://tile-push-bundles/t/{appId}/ for
+// the authenticated appId. Without this prefix check a deploy token holder
+// could pull other tenants' bundles. The signed URL has a 5-minute TTL — the
+// CLI fetches immediately, so a long window has no use beyond replay surface.
+// -----------------------------------------------------------------------------
+cliApp.get("/t/:appId/storage/download-url", async (c) => {
+  const auth = getCliAuth(c);
+  const uri = c.req.query("uri");
+  if (!uri) {
+    return c.json({ error: "Missing required query param: uri." }, 400);
+  }
+
+  // Parse gs://{bucket}/{key} and enforce tenant scoping on the key prefix.
+  const expectedPrefix = `gs://${STORAGE_BUCKET}/t/${auth.appId}/`;
+  if (!uri.startsWith(expectedPrefix)) {
+    return c.json(
+      {
+        error:
+          "Invalid uri: must begin with gs://tile-push-bundles/t/{your-appId}/",
+      },
+      400,
+    );
+  }
+  const objectKey = uri.slice(`gs://${STORAGE_BUCKET}/`.length);
+  if (objectKey.includes("..")) {
+    return c.json({ error: "Invalid uri: path traversal not allowed." }, 400);
+  }
+
+  const bucket = admin.storage().bucket(STORAGE_BUCKET);
+  const file = bucket.file(objectKey);
+  const [exists] = await file.exists();
+  if (!exists) {
+    return c.json({ error: "Object not found." }, 404);
+  }
+
+  const [downloadUrl] = await file.getSignedUrl({
+    version: "v4",
+    action: "read",
+    expires: Date.now() + DOWNLOAD_URL_TTL_MS,
+  });
+
+  return c.json({ downloadUrl });
 });
 
 // -----------------------------------------------------------------------------
@@ -182,6 +315,13 @@ cliApp.post("/t/:appId/bundles", async (c) => {
     applied.push({ operation: change.operation, bundleId: bundle.id });
   }
   await db.commitBundle();
+
+  // Invalidate the tenant's CDN cache for check-update so devices see the new
+  // bundle on their next request instead of waiting for s-maxage to expire.
+  // Fire-and-await — we want the deploy response to wait for invalidation so
+  // CLI users know when devices will pick up the new bundle.
+  const appId = c.req.param("appId") ?? getCliAuth(c).appId;
+  await invalidateTenantCache(appId);
 
   return c.json({ applied });
 });
