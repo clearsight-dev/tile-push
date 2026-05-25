@@ -26,7 +26,7 @@ export interface TilePushCredentials {
   apiUrl?: string;
 }
 
-const DEFAULT_API_URL = "https://api.tile-push.app";
+const DEFAULT_API_URL = "https://ota.tile.dev";
 
 const credentialsPath = () => join(homedir(), ".tile-push", "credentials.json");
 const credentialsDir = () => join(homedir(), ".tile-push");
