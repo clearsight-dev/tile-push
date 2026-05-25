@@ -282,10 +282,11 @@ const handleFingerprintUpdateWithCohort: RouteHandler = async (
   });
 };
 
-// v2: cohort-less endpoint that returns ALL eligible candidate bundles.
-// Designed for CDN caching — same URL across devices with different cohorts
-// gives ~100% hit rate. Client picks the matching bundle locally based on its
-// cohort and each candidate's eligibleNumericCohorts / targetCohorts.
+// v2: cohort-less endpoint that returns ALL candidate bundles. Designed for
+// CDN caching — same URL across devices with different cohorts gives ~100%
+// hit rate. Client picks the matching bundle locally by running
+// `isCohortEligibleForUpdate(id, deviceCohort, rolloutCohortCount,
+// targetCohorts)` per candidate — no enumerated cohort list on the wire.
 const handleFingerprintCandidates: RouteHandler = async (
   params,
   _request,

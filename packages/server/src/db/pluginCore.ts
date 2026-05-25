@@ -8,7 +8,6 @@ import type {
   UpdateInfo,
 } from "@hot-updater/core";
 import {
-  getRolledOutNumericCohorts,
   isCohortEligibleForUpdate,
   NIL_UUID,
   NUMERIC_COHORT_SIZE,
@@ -33,14 +32,6 @@ import { resolveManifestArtifacts } from "./updateArtifacts";
 
 const PAGE_SIZE = 100;
 const DESC_ORDER = { field: "id", direction: "desc" } as const;
-
-// Cohort set that always passes the client picker's eligibility test —
-// attached to ROLLBACK candidates so the client treats them as universally
-// eligible, mirroring v1's "rollback ignores cohort" behavior.
-const ALL_NUMERIC_COHORTS: number[] = Array.from(
-  { length: NUMERIC_COHORT_SIZE },
-  (_, i) => i + 1,
-);
 
 const bundleMatchesQueryWhere = (
   bundle: Bundle,
@@ -466,12 +457,12 @@ export function createPluginDatabaseCore<TContext = unknown>(
       // Tag each bundle with its v1-equivalent status, short-circuit on the
       // first older bundle (ROLLBACK target), and append the same after-loop
       // INIT_BUNDLE_ROLLBACK that v1 emits — under the same gating
-      // conditions. The client picker becomes a trivial cohort filter.
-      //
-      // Each candidate carries `eligibleNumericCohorts` + `targetCohorts`.
-      // ROLLBACK candidates (real older or synthetic init-rollback) are
-      // marked always-eligible to mirror v1's "no cohort check on rollback"
-      // behavior.
+      // conditions. The client picker computes eligibility from
+      // `(id, rolloutCohortCount, targetCohorts)` via the shared
+      // `isCohortEligibleForUpdate` math — no enumerated cohort list ships
+      // on the wire. ROLLBACK candidates (real older or synthetic
+      // init-rollback) advertise `rolloutCohortCount = 1000` so any numeric
+      // device cohort passes — mirroring v1's "no cohort check on rollback".
       // ─────────────────────────────────────────────────────────────────────
       const channel = args.channel ?? "production";
       const minBundleId = args.minBundleId ?? NIL_UUID;
@@ -597,23 +588,21 @@ export function createPluginDatabaseCore<TContext = unknown>(
             }
           }
 
-          const normalizedRolloutCount = normalizeRolloutCohortCount(
-            bundle.rolloutCohortCount,
-          );
-          const eligibleNumericCohorts = alwaysEligible
-            ? ALL_NUMERIC_COHORTS
-            : getRolledOutNumericCohorts(
-                bundle.id,
-                bundle.rolloutCohortCount,
-              );
+          // alwaysEligible ROLLBACK candidates advertise 100% rollout
+          // (matches v1's "ignore cohort on rollback") so the client picker
+          // accepts any numeric device cohort. Custom cohort allowlists are
+          // dropped — they only narrow eligibility, which we don't want
+          // for rollbacks.
+          const rolloutCohortCount = alwaysEligible
+            ? NUMERIC_COHORT_SIZE
+            : normalizeRolloutCohortCount(bundle.rolloutCohortCount);
 
           return {
             ...enriched,
-            rolloutCohortCount: normalizedRolloutCount,
+            rolloutCohortCount,
             targetCohorts: alwaysEligible
               ? []
               : (bundle.targetCohorts ?? []),
-            eligibleNumericCohorts,
           };
         }),
       );
@@ -635,7 +624,6 @@ export function createPluginDatabaseCore<TContext = unknown>(
           fileUrl: null,
           rolloutCohortCount: NUMERIC_COHORT_SIZE,
           targetCohorts: [],
-          eligibleNumericCohorts: ALL_NUMERIC_COHORTS,
         } as AppUpdateCandidate);
       }
 

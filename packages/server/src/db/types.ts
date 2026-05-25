@@ -80,7 +80,6 @@ export function getSQLProvider(
 export type AppUpdateCandidate = AppUpdateAvailableInfo & {
   rolloutCohortCount: number;
   targetCohorts: string[];
-  eligibleNumericCohorts: number[];
 };
 
 export interface AppUpdateCandidatesResponse {
@@ -101,11 +100,12 @@ export interface DatabaseAPI<TContext = unknown> {
     context?: HotUpdaterContext<TContext>,
   ): Promise<AppUpdateAvailableInfo | null>;
   /**
-   * v2: returns all eligible candidate bundles for a check-update request,
-   * without applying the cohort filter. Each candidate is enriched with the
-   * data the client needs to pick locally (rollout count, target cohorts,
-   * precomputed eligible numeric cohort set). Designed for CDN cacheability
-   * — the URL no longer includes the device's cohort.
+   * v2: returns all candidate bundles for a check-update request, without
+   * applying the cohort filter. Each candidate carries `rolloutCohortCount`
+   * + `targetCohorts`; the client computes eligibility locally via the
+   * shared `isCohortEligibleForUpdate` math (no enumerated cohort list on
+   * the wire). Designed for CDN cacheability — the URL no longer includes
+   * the device's cohort.
    */
   getAppUpdateCandidates(
     args: GetBundlesArgs,
