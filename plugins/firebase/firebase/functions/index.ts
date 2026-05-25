@@ -23,7 +23,9 @@ if (!admin.apps.length) {
 
 const adminOptions = admin.app().options;
 const storageBucket = adminOptions.storageBucket;
-const cdnUrl = process.env.HOT_UPDATER_CDN_URL;
+// Default to Cloud CDN host. Override via HOT_UPDATER_CDN_URL env var if a
+// different origin is needed (local emulator, alternate domain).
+const cdnUrl = process.env.HOT_UPDATER_CDN_URL ?? "https://ota.tile.dev";
 
 if (!storageBucket) {
   throw new Error(
@@ -54,69 +56,6 @@ app.get("/ping", (c) => {
 });
 
 app.mount(HOT_UPDATER_BASE_PATH, hotUpdater.handler);
-
-// In-memory response cache. Persists across requests on the same warm Cloud
-// Run instance. Each instance has its own copy. TTL is short so a new deploy
-// is reflected within a minute.
-type CacheEntry = {
-  body: string;
-  status: number;
-  contentType: string;
-  expires: number;
-};
-const responseCache = new Map<string, CacheEntry>();
-const CACHE_TTL_MS = 60_000;
-
-// Cache key includes tenant scope so two tenants with otherwise-identical URLs
-// (after the /t/{appId}/ prefix is stripped) cannot share a cache entry.
-// Cross-tenant cache leakage would be a security bug.
-async function cachedFetch(
-  request: Request,
-  tenantScope: string | null,
-): Promise<Response> {
-  const url = new URL(request.url);
-  const isCacheable =
-    request.method === "GET" && url.pathname.startsWith(`${HOT_UPDATER_BASE_PATH}/`);
-  const key = `${tenantScope ?? "_"}|${url.pathname}`;
-
-  if (isCacheable) {
-    const cached = responseCache.get(key);
-    if (cached && cached.expires > Date.now()) {
-      console.log(`[cache] HIT  ${key}`);
-      return new Response(cached.body, {
-        status: cached.status,
-        headers: {
-          "content-type": cached.contentType,
-          "x-tile-cache": "hit",
-        },
-      });
-    }
-  }
-
-  const response = await app.fetch(request);
-
-  if (isCacheable && response.status === 200) {
-    const clone = response.clone();
-    const body = await clone.text();
-    const contentType = clone.headers.get("content-type") || "application/json";
-    responseCache.set(key, {
-      body,
-      status: response.status,
-      contentType,
-      expires: Date.now() + CACHE_TTL_MS,
-    });
-    console.log(`[cache] MISS ${key}`);
-    return new Response(body, {
-      status: response.status,
-      headers: {
-        ...Object.fromEntries(response.headers.entries()),
-        "x-tile-cache": "miss",
-      },
-    });
-  }
-
-  return response;
-}
 
 // URL pattern: extract /t/{appId}/ tenant prefix from the v2 paths.
 // Stripped path is forwarded to the upstream handler — upstream code has no
@@ -166,6 +105,10 @@ const handler = onRequest(
       for (const [key, value] of honoResponse.headers.entries()) {
         res.setHeader(key, value);
       }
+      // CLI/admin endpoints must never be CDN-cached. Bearer-token-scoped,
+      // and POST/PATCH/DELETE flows that mutate Firestore.
+      res.setHeader("Cache-Control", "private, no-store");
+      res.setHeader("Vary", "Authorization");
       res.send(await honoResponse.text());
       return;
     }
@@ -207,22 +150,62 @@ const handler = onRequest(
         req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined,
     });
 
-    // 2. Run the entire downstream stack inside an ALS context so the
-    //    firebase plugin can read appId via currentAppId() at any depth.
-    const runOnce = async () => {
-      const honoResponse = await cachedFetch(request, appId);
-      res.status(honoResponse.status);
-      for (const [key, value] of honoResponse.headers.entries()) {
-        res.setHeader(key, value);
-      }
-      res.send(await honoResponse.text());
-    };
+    // 2. Forward to Hono. Only the fetch needs the tenant ALS context — the
+    //    firebase plugin reads currentAppId() during DB/storage calls
+    //    underneath app.fetch(). Express response writes happen outside the
+    //    context, which is fine since they touch no tenant-scoped data.
+    const honoResponse = await (appId
+      ? tenantALS.run({ appId }, () => app.fetch(request))
+      : app.fetch(request));
 
-    if (appId) {
-      await tenantALS.run({ appId }, runOnce);
-    } else {
-      await runOnce();
+    res.status(honoResponse.status);
+    for (const [key, value] of honoResponse.headers.entries()) {
+      res.setHeader(key, value);
     }
+    // CDN-friendly Cache-Control. Device honors max-age=60 (foreground
+    // freshness), Cloud CDN honors s-maxage=2592000 (30 days). We explicitly
+    // invalidate per tenant on every deploy via urlMaps.invalidateCache, so
+    // the long s-maxage never causes staleness in practice.
+    if (effectivePath.startsWith("/api/check-update/")) {
+      res.setHeader(
+        "Cache-Control",
+        "public, max-age=60, s-maxage=2592000",
+      );
+    }
+
+    // Strip eligibleNumericCohorts from v2 check-update responses.
+    //
+    // Upstream's pluginCore expands the per-bundle rollout cohort set into a
+    // ~1000-element int array per candidate (~3.8KB raw, ~600B gzipped). The
+    // tile-push picker (packages/tile-push-react-native/src/picker.ts) doesn't
+    // consume it — it derives eligibility by calling isCohortEligibleForUpdate
+    // from @hot-updater/core with (id, cohort, rolloutCohortCount,
+    // targetCohorts), which is the same deterministic function the server
+    // used to build the array. So the field is purely vestigial bloat.
+    //
+    // Cheaper to drop here than to patch upstream — keeps packages/server
+    // untouched (CLAUDE.md rule 6) and the CDN caches the trimmed body
+    // anyway, so this parse+stringify runs once per cache miss.
+    let outBody = await honoResponse.text();
+    if (
+      effectivePath.startsWith("/api/check-update/v2/") &&
+      honoResponse.headers.get("content-type")?.includes("application/json")
+    ) {
+      try {
+        const parsed = JSON.parse(outBody) as {
+          candidates?: Array<Record<string, unknown>>;
+        };
+        if (Array.isArray(parsed.candidates)) {
+          for (const candidate of parsed.candidates) {
+            delete candidate.eligibleNumericCohorts;
+          }
+          outBody = JSON.stringify(parsed);
+        }
+      } catch {
+        // Malformed JSON — fall through with the original body untouched.
+      }
+    }
+    res.send(outBody);
   },
 );
 
