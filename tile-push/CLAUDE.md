@@ -16,11 +16,15 @@ Current state: **multi-tenant MVP deployed with CDN edge caching**. Every check-
 | Region | `us-central1` |
 | Cloud Function name | `tile-push` (Gen 2, runs on Cloud Run) |
 | Function URL (direct origin) | `https://tile-push-io7lmh2oqa-uc.a.run.app` |
-| **Hosting URL (CDN-fronted, primary)** | `https://apptile-staging-setup.web.app` |
+| **Primary URL (Cloud CDN + LB)** | `https://ota.tile.dev` ← SDK baseURL, customer-facing |
+| Fallback URL (Firebase Hosting) | `https://apptile-staging-setup.web.app` (kept alive for old SDK builds) |
+| Cloud LB resources | static IP `tile-push-lb-ip`, cert `tile-push-cert-v2`, URL map `tile-push-lb`, NEG `tile-push-neg`, backends `backend-checkupdate` / `backend-admin` / `backend-bundles` — see [`GCP_INFRASTRUCTURE.md`](./GCP_INFRASTRUCTURE.md) |
+| DNS | `ota.tile.dev A 8.233.151.195` on AWS Route 53 (tile.dev hosted zone) |
 | Firestore database | `tile-push` (named DB, not `(default)`) |
-| Storage bucket | `tile-push-bundles` (in same project, us-central1) |
-| Deploys via | `firebase deploy` from `plugins/firebase/deploy/` |
-| Test tenant in Firestore | `tk_tilepacket-test` (3 backfilled bundles) |
+| Storage bucket | `tile-push-bundles` (in same project, us-central1; public-read, immutable Cache-Control on every object) |
+| Deploys via | `firebase deploy --only functions,hosting --project=apptile-staging-setup` from `plugins/firebase/deploy/` |
+| Cache invalidation | Cloud Run calls `urlMaps.invalidateCache` after every successful deploy — pattern `/api/check-update/v2/t/{appId}/*` |
+| Test tenant in Firestore | `tk_tilepacket-test` (3 backfilled bundles), `tk_apptile-seed`, `tk_tilepacket` |
 
 ## Hard rules for any code change
 
@@ -144,7 +148,7 @@ plugins/firebase/
 | Add a new field to bundles | Add to `Bundle` interface in `packages/core/src/types.ts`; `SnakeCaseBundle` auto-derives. Then add the field to `convertToBundle` + `commitBundle` in `firebaseDatabase.ts`. Inject value from request/context (must NOT trust client for security-sensitive fields). |
 | Change a Firestore query | Edit `plugins/firebase/src/firebaseDatabase.ts`. ALWAYS keep the `.where("app_id", "==", appId)` filter. Update `firestore.indexes.json` if you add a new composite-filter combination. |
 | Add a new HTTP route | Add to `plugins/firebase/firebase/functions/index.ts` (firebase-specific) OR (rarely) `packages/server/src/handler.ts` (universal). Multi-tenant routes MUST go under `/v2/t/{appId}/`. Pure-tenant-agnostic routes (health, version) go elsewhere. |
-| Change cohort math | Edit `packages/core/src/rollout.ts`. The v2 endpoint sends `eligibleNumericCohorts` to clients; algorithm must stay deterministic per-bundleId. |
+| Change cohort math | Edit `packages/core/src/rollout.ts`. Both server and client call `isCohortEligibleForUpdate(id, cohort, rolloutCohortCount, targetCohorts)` to compute eligibility independently — algorithm must stay deterministic per-bundleId so they agree. (The redundant `eligibleNumericCohorts` array was stripped from responses on 2026-05-26; see [`LATENCY_ANALYSIS.md`](./LATENCY_ANALYSIS.md).) |
 | Add a new tenant | (Future) admin endpoint to create one. For now, just start using a new `tk_*` appId — the test path doesn't require pre-registration, queries just return empty for unknown tenants. |
 | Bundle build | `pnpm nx build @hot-updater/firebase` from repo root. Sync `dist/` to `tilepacket/node_modules/@hot-updater/firebase/dist/` for CLI testing. |
 | Deploy | See `DEPLOYMENT.md`. Quick form: assemble `deploy/`, `firebase deploy --only functions:tile-push,firestore:indexes,hosting --project apptile-staging-setup`. |
@@ -166,39 +170,65 @@ plugins/firebase/
 ## Quick verification commands
 
 ```bash
-# Confirm the deployed function works through CDN
-curl 'https://apptile-staging-setup.web.app/api/check-update/v2/t/tk_tilepacket-test/fingerprint/android/6d12336b9f6e00805a4eaa21aa1fb36249fac10a/production/00000000-0000-0000-0000-000000000000/00000000-0000-0000-0000-000000000000'
-# expect: { "candidates": [ ...3 bundles... ] }
+# Confirm Cloud CDN serves check-update (after SSL cert is ACTIVE)
+curl -I https://ota.tile.dev/api/check-update/version
+# expect: HTTP/2 200, Cache-Control: public, max-age=60, s-maxage=2592000
+
+# Confirm tenant returns candidates through CDN
+curl 'https://ota.tile.dev/api/check-update/v2/t/tk_tilepacket-test/fingerprint/android/6d12336b9f6e00805a4eaa21aa1fb36249fac10a/production/00000000-0000-0000-0000-000000000000/00000000-0000-0000-0000-000000000000'
+# expect: { "candidates": [ ...bundles with fileUrl: "https://ota.tile.dev/t/..." ] }
 
 # Confirm tenant isolation — different tenant gets empty candidates
-curl 'https://apptile-staging-setup.web.app/api/check-update/v2/t/tk_some-other-tenant/fingerprint/android/6d12336b9f6e00805a4eaa21aa1fb36249fac10a/production/00000000-0000-0000-0000-000000000000/00000000-0000-0000-0000-000000000000'
+curl 'https://ota.tile.dev/api/check-update/v2/t/tk_some-other-tenant/fingerprint/android/6d12336b9f6e00805a4eaa21aa1fb36249fac10a/production/00000000-0000-0000-0000-000000000000/00000000-0000-0000-0000-000000000000'
 # expect: { "candidates": [] }
 
 # Confirm fails-closed — no tenant returns 400
-curl -i 'https://apptile-staging-setup.web.app/api/check-update/v2/fingerprint/android/6d12336b9f6e00805a4eaa21aa1fb36249fac10a/production/00000000-0000-0000-0000-000000000000/00000000-0000-0000-0000-000000000000'
+curl -i 'https://ota.tile.dev/api/check-update/v2/fingerprint/android/6d12336b9f6e00805a4eaa21aa1fb36249fac10a/production/00000000-0000-0000-0000-000000000000/00000000-0000-0000-0000-000000000000'
 # expect: HTTP 400 { "error": "Tenant required..." }
+
+# Confirm fallback URL still works (for unrebuilt old apps)
+curl -I https://apptile-staging-setup.web.app/api/check-update/version
+
+# Confirm bundle bytes have immutable cache-control via CDN
+curl -I https://ota.tile.dev/t/tk_apptile-seed/{any-bundleId}/bundle.zip
+# expect: HTTP/2 200, Cache-Control: public, max-age=31536000, immutable
+
+# Confirm admin endpoints are never cached
+curl -I https://ota.tile.dev/api/cli/t/tk_apptile-seed/me
+# expect: HTTP/2 401, Cache-Control: private, no-store, Vary: Authorization
+
+# After a deploy, confirm CDN invalidation fired
+gcloud logging read 'resource.type=cloud_run_revision AND textPayload:"[cdn] invalidated"' --limit=5 --format="value(textPayload)"
 
 # See Firestore databases in the project
 gcloud firestore databases list --project=apptile-staging-setup
 
 # List Cloud Functions (should show tile-push)
 gcloud functions list --project=apptile-staging-setup --regions=us-central1
+
+# Inspect Cloud CDN cache settings on the backend service
+gcloud compute backend-services describe backend-checkupdate --global --format=yaml | grep -A 5 cdnPolicy
 ```
 
 ## Roadmap
 
 Done:
 1. ✓ Multi-tenancy: `appId` enforcement on all queries, tenant-scoped URLs (`/api/check-update/v2/t/{appId}/...`), tenant-scoped storage prefixes, tenant-scoped cache keys
-2. ✓ CDN: Firebase Hosting fronts the function, 60s TTL on v2 paths, sub-150ms TTFB from India POPs
-3. ✓ In-memory cache layer inside Cloud Run instance
-4. ✓ Public bucket + cdnUrl (no signBlob hot-path latency)
+2. ✓ CDN v1: Firebase Hosting fronts the function, 60s TTL on v2 paths, sub-150ms TTFB from India POPs
+3. ✓ CDN v2 (2026-05-25): Google Cloud CDN + Global LB fronts `ota.tile.dev`. Per-tenant invalidation on every deploy, 30d edge TTL, immutable bundle bytes. Full GCP inventory: [`GCP_INFRASTRUCTURE.md`](./GCP_INFRASTRUCTURE.md).
+4. ✓ In-memory cache layer inside Cloud Run instance (kept as belt-and-suspenders behind Cloud CDN)
+5. ✓ Public bucket + cdnUrl (no signBlob hot-path latency)
+6. ✓ Customer-facing `@tile-push/cli` deploy CLI (wraps hot-updater CLI; multi-tenant aware)
+7. ✓ Customer-facing `@tile-push/react-native` SDK fork (baseURL = `https://ota.tile.dev`)
+8. ✓ Bearer-token CLI auth (`tenants/{appId}/deployTokens[]`, SHA-256 hashed)
 
 Not yet:
-5. Tenant API key auth for write/admin endpoints
-6. Tenant onboarding flow + admin console
-7. MAU tracking compatible with CDN (Cloudflare Analytics Engine or separate `/ping` endpoint)
-8. Migrate bundle storage from Firebase Storage to Cloudflare R2 (zero egress fees) — see `LATENCY_ANALYSIS.md`
-9. Customer-facing RN SDK fork
-10. Customer-facing CLI fork that uploads bundles via API (not direct GCS)
-11. Stripe billing
-12. v1 deprecation — once all clients on v2, remove the v1 routes (they currently throw because of tenant requirement)
+9. Per-project credentials store (multi-appId on same laptop)
+10. Tenant onboarding flow + admin web console (rebrand of `@hot-updater/console`, repo: `tile-web`)
+11. npm publish for `@tile-push/cli` + `@tile-push/react-native`
+12. Patch generation (server-side bsdiff per asset) so devices fetch only changed bytes
+13. MAU tracking compatible with CDN (Cloudflare Analytics Engine or separate `/ping` endpoint)
+14. Stripe billing
+15. v1 deprecation — once all clients on v2, remove the v1 routes (they currently throw because of tenant requirement)
+16. POST-DEMO: migrate to Cloudflare Workers + R2 + D1 stack (~98% cost reduction at hyper-viral scale)
+17. POST-DEMO: iOS bare RN integration guide

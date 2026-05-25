@@ -1,98 +1,136 @@
 # tile-push Architecture
 
-This document describes the current multi-tenant MVP architecture and how it works end-to-end. Read this when you need to understand what runs where, why it's structured the way it is, or how to change it.
+This document describes the current multi-tenant production architecture and how it works end-to-end. Read this when you need to understand what runs where, why it's structured the way it is, or how to change it.
+
+**Companion doc:** [`GCP_INFRASTRUCTURE.md`](./GCP_INFRASTRUCTURE.md) — exhaustive resource-by-resource inventory of every GCP entity. Read that when you need to know the exact resource name, gcloud command, or rollback step.
 
 ## High-level diagram
 
 ```
                                         ┌─ DEPLOY PATH ──────────────────┐
                                         │ Developer machine              │
-                                        │  $ npx hot-updater deploy      │
-                                        │  ↳ uses appId from config      │
-                                        │  ↳ uploads to t/{appId}/...    │
-                                        │  ↳ writes Firestore doc w/     │
-                                        │    app_id = tk_acme            │
+                                        │  $ npx tile-push deploy        │
+                                        │   1. POST /api/cli/.../upload- │
+                                        │      url → signed PUT URL      │
+                                        │   2. PUT bytes direct to GCS   │
+                                        │      (bypasses LB)             │
+                                        │   3. POST /api/cli/.../bundles │
+                                        │      → Firestore commit        │
+                                        │   4. Cloud CDN invalidate      │
+                                        │      /api/check-update/v2/     │
+                                        │      t/{appId}/*               │
                                         └──────────────┬─────────────────┘
                                                        │
                                                        ▼
                                               gs://tile-push-bundles/
                                               t/{appId}/{bundleId}/
                                                 bundle.zip + assets
+                                              Cache-Control: max-age=
+                                                31536000, immutable
                                                        │
                                                        │
 ┌──────────────────┐                                   │
 │ React Native app │                                   │
-│  HotUpdater.wrap │                                   │
+│  TilePush.wrap   │                                   │
 │  ({appId})       │     READ PATH                     │
-│                  │                                   │
-│ GET /api/check-  │ ─── HTTPS ───▶ ┌──────────────────▼────────────────────┐
-│ update/v2/t/     │                │ Firebase Hosting CDN                  │
-│ {appId}/...      │ ◀── JSON ───── │ (Google edge POPs)                    │
-└────────┬─────────┘                │                                       │
-         │                          │ ✓ cache HIT (~99%): serves from POP   │
-         │                          │ ✗ cache MISS: forwards to origin      │
-         │ download                 └──────────┬────────────────────────────┘
-         │ from public URL                     │ (cache MISS only)
-         │                                     ▼
-         │                          ┌────────────────────────────────────┐
-         │                          │ Cloud Function tile-push           │
-         │                          │ us-central1 (Gen 2 / Cloud Run)    │
-         │                          │                                    │
-         │                          │ 1. Tenant middleware:              │
-         │                          │    extract /t/{appId}/, validate,  │
-         │                          │    strip from path, set ALS ctx    │
-         │                          │ 2. In-memory cache check           │
-         │                          │ 3. Hono → upstream handler         │
-         │                          │ 4. firebaseDatabase plugin reads   │
-         │                          │    currentAppId() from ALS         │
-         │                          │ 5. Firestore query with            │
-         │                          │    .where("app_id", "==", appId)   │
-         │                          └──────────┬─────────────────────────┘
-         │                                     │
-         │                                     ▼
-         │                          ┌────────────────────────────────────┐
-         │                          │ Firestore (named DB: tile-push)    │
-         │                          │  collection: bundles               │
-         │                          │  every doc has app_id field        │
-         │                          │  every composite index has app_id  │
-         │                          │  as first column                   │
-         │                          └────────────────────────────────────┘
+│                  │     baseURL = ota.tile.dev        │
+│ GET ota.tile.dev/│ ─── HTTPS ───▶                    │
+│ api/check-update/│                                   │
+│ v2/t/{appId}/... │                AWS Route 53 DNS   │
+└────────┬─────────┘                ota.tile.dev → A → │
+         │                          8.233.151.195      │
+         │                                  │          │
+         │                                  ▼          │
+         │                        Google Cloud LB      │
+         │                        (global static IP)   │
+         │                        + Google-managed SSL │
+         │                        cert (tile-push-     │
+         │                         cert-v2)            │
+         │                                  │          │
+         │                                  ▼          │
+         │                        URL map: path-routed │
+         │      ┌───────────────────────────┼─────────────────────┐
+         │      │                           │                     │
+         │ /api/check-update/*    /api/cli/*, /ping        /* (default)
+         │      │                           │                     │
+         │      ▼                           ▼                     ▼
+         │  backend-checkupdate       backend-admin       backend-bundles
+         │  Cloud CDN ON              Cloud CDN OFF       Cloud CDN ON
+         │  s-maxage=30d              no-store            max-age=1yr
+         │  invalidate per tenant     Vary: Auth          immutable
+         │  query string excluded                        (GCS bucket)
+         │  from cache key                                       │
+         │      │                           │                    ▼
+         │      └────► Serverless NEG ◄─────┘             gs://tile-push-
+         │             tile-push-neg                       bundles
+         │                  │                              (public-read,
+         │                  ▼                              same bucket as
+         │           Cloud Run service:                    deploy path)
+         │           tile-push (us-central1)
+         │                  │
+         │      ┌───────────┴───────────┐
+         │      ▼                       ▼
+         │  Layer 2: tenant         Layer 4: Hono router
+         │  middleware              → upstream handler
+         │  (AsyncLocalStorage)         │
+         │                              ▼
+         │                       firebaseDatabase plugin
+         │                       (reads appId from ALS,
+         │                        adds .where("app_id"...))
+         │                              │
+         │                              ▼
+         │                       Firestore (named DB: tile-push)
+         │                         collection: bundles
+         │                         every doc has app_id field
+         │                         every composite index has
+         │                         app_id as first column
          │
          ▼
-   gs://tile-push-bundles/t/{appId}/{bundleId}/bundle.zip
-   (public-read, served directly via Google's edge — zero signing latency)
+   https://ota.tile.dev/t/{appId}/{bundleId}/bundle.zip
+   (Cloud CDN edge → GCS, immutable, ~5ms on cache hit)
 ```
+
+**Fallback still alive:** `https://apptile-staging-setup.web.app/api/**` continues to work via Firebase Hosting → same Cloud Run service. Old SDK builds that haven't been rebuilt against `ota.tile.dev` keep working.
 
 ## Tech stack
 
 | Layer | Tech | Why this choice |
 |---|---|---|
-| CDN / edge cache | Firebase Hosting (Google's global edge network) | Free for static + function rewrites, same edge POPs as Cloud CDN, no LB cost, auto SSL |
-| Function runtime | Firebase Cloud Functions Gen 2 (which is Cloud Run under the hood) | Auto-scales 0→N, native Firebase integration, GCP credits apply |
+| Domain | `ota.tile.dev` (subdomain of tile.dev, A record on AWS Route 53) | Stable customer-facing URL, DNS-portable so we can move backends without app rebuild |
+| CDN / edge cache | Google Cloud CDN behind a Global External HTTPS LB | Explicit per-tenant invalidation on deploy, 30d edge TTL, query string excluded from cache key. Same edge fleet as Firebase Hosting but with control over invalidation and TTLs. |
+| Load Balancer | Global External HTTPS LB with serverless NEG → Cloud Run | Path-based routing splits cacheable check-update from non-cacheable CLI from immutable bundle bytes. ~$18/mo + ~$0.008/GB. |
+| SSL | Google-managed cert (`tile-push-cert-v2`), DNS-validated | Free, auto-renews. Provisions only after DNS is correctly set up (lesson learned the hard way). |
+| Function runtime | Firebase Cloud Functions Gen 2 (Cloud Run under the hood) | Auto-scales 0→N, native Firebase integration, GCP credits apply |
 | Web framework | Hono (inside the function) + Express (provided by Google's Functions Framework) | Hono is runtime-portable; Express is what Cloud Functions speaks. A small adapter bridges them. |
 | Tenant context propagation | Node.js `AsyncLocalStorage` | Per-request store visible to deeply nested async code without parameter threading. Upstream code stays untouched. |
-| In-instance cache | Module-level `Map<string, CacheEntry>` with TTL | Zero infra; works across Cloud Run requests on the same warm instance. Cache key is tenant-scoped. |
+| In-instance cache | Module-level `Map<string, CacheEntry>` with TTL | Per-warm-instance burn cache, mostly redundant now that Cloud CDN absorbs the bulk of reads. Kept for cheap insurance. |
 | Database | Firestore Native mode, named database `tile-push` | NoSQL doc store, auto-scales to billions of docs, GCP credits cover it. Note: Admin SDK bypasses Security Rules, so tenant isolation is enforced at the plugin layer. |
-| Bundle storage | Firebase Cloud Storage (`tile-push-bundles` bucket, public-read, tenant-prefixed) | Same project, lowest config friction. Public-read removes signBlob bottleneck. Tenant prefix lets us cleanly delete a tenant's data with a single recursive `rm`. Will migrate to Cloudflare R2 later. |
+| Bundle storage | GCS (`tile-push-bundles` bucket, public-read, tenant-prefixed, immutable Cache-Control on every object) | Same project, lowest config friction. Public-read removes signBlob bottleneck. Tenant prefix lets us cleanly delete a tenant's data with a single recursive `rm`. Served via Cloud CDN backend bucket. Will migrate to Cloudflare R2 later. |
+| Cache invalidation | Cloud CDN `urlMaps.invalidateCache` API, called from Cloud Run after every successful deploy | Tenant-scoped path pattern: `/api/check-update/v2/t/{appId}/*`. <60s typical propagation, 1000/mo free quota. |
+| Fallback URL | Firebase Hosting at `apptile-staging-setup.web.app` | Kept alive so old SDK builds (apptile-seed, tilepacket) keep working while we transition consumers to `ota.tile.dev`. Decommission ~1 week post-cutover. |
 | Build | `tsdown` (TypeScript bundler using rolldown) | Used by the upstream hot-updater repo; bundles everything except `firebase-functions` + `firebase-admin` |
 | Deploy CLI | `firebase` (firebase-tools) | Standard Firebase deploy tool — handles function provisioning, IAM, indexes, hosting |
 
 ## What's actually running
 
-When a request hits `https://apptile-staging-setup.web.app/api/check-update/v2/t/{appId}/fingerprint/...`, this is the call chain:
+When a request hits `https://ota.tile.dev/api/check-update/v2/t/{appId}/fingerprint/...`, this is the full call chain:
 
 ```
 [User device]
-   │  HTTPS request
+   │  HTTPS request → DNS resolves ota.tile.dev → 8.233.151.195
    ▼
-[Firebase Hosting CDN — Google's edge network]
-   │  TLS termination at nearest POP (e.g. MAA for India)
-   │  Check Cache Rule for /api/check-update/v2/**:
-   │   ├─ HIT  → serve from POP shard (~5ms server time, ~100ms total client)
-   │   └─ MISS → forward to origin                                    ─┐
-                                                                       │
-[Google's Cloud Run frontend] ◀──────────────────────────────────────── ┘
-   │  TLS termination at us-central1
+[Global External HTTPS Load Balancer]
+   │  TLS termination at nearest Google edge POP (tile-push-cert-v2)
+   │  URL map: ota.tile.dev/api/check-update/* → backend-checkupdate
+   │
+[Cloud CDN — at the edge POP]
+   │  Cache key: (host, path) — query string EXCLUDED
+   │  Cache lookup:
+   │   ├─ HIT  → serve from edge cache (~5ms total)
+   │   └─ MISS → cache fill from origin (Cloud Run)                  ─┐
+                                                                      │
+[backend-checkupdate's serverless NEG] ◀──────────────────────────────┘
+   │  Routes to Cloud Run service "tile-push" (us-central1)
    │
    ▼
 [Container running our bundled index.cjs]
@@ -103,6 +141,9 @@ When a request hits `https://apptile-staging-setup.web.app/api/check-update/v2/t
    │
    ├─ Layer 2: onRequest() adapter (in our code)
    │     Converts Express (req, res) → Web Request
+   │     Adds Cache-Control header to response based on path:
+   │       /api/check-update/* → public, max-age=60, s-maxage=2592000
+   │       /api/cli/*          → private, no-store + Vary: Authorization
    │
    ├─ Layer 2.5: TENANT MIDDLEWARE (in our code) — multi-tenant gate
    │     Match URL: /api/check-update/v2/t/{appId}/(.+)
@@ -112,8 +153,8 @@ When a request hits `https://apptile-staging-setup.web.app/api/check-update/v2/t
    │
    ├─ Layer 3: In-memory cache check (in our code)
    │     Cache key: `${appId}|${url.pathname}`
-   │     HIT  → return cached response (~5ms server time)
-   │     MISS → call app.fetch(request)
+   │     Mostly redundant now (Cloud CDN absorbs most reads) but kept
+   │     as cheap insurance — Cloud Run cold start can warm faster
    │
    ├─ Layer 4: Hono app router
    │     Matches /api/check-update/* → hotUpdater.handler
@@ -122,14 +163,34 @@ When a request hits `https://apptile-staging-setup.web.app/api/check-update/v2/t
    │     Matches /v2/fingerprint, /v2/app-version, /version, etc.
    │     Calls business logic
    │
-   └─ Layer 6: firebaseDatabase plugin (tenant-aware)
-         Calls currentAppId() — reads from ALS (set in Layer 2.5)
+   └─ Layer 6: firebaseDatabase + firebaseFunctionsStorage plugins (tenant-aware)
+         currentAppId() reads from ALS (set in Layer 2.5)
          Adds .where("app_id", "==", appId) to every Firestore query
          Verifies returned docs have matching app_id (defense-in-depth)
-         Generates plain (unsigned) storage URLs from doc's storage_uri
+         For each candidate, storage plugin transforms gs:// URI into
+         CDN URL using HOT_UPDATER_CDN_URL=https://ota.tile.dev
 ```
 
-Six layers, but only Layers 2.5, 3, and 6 are tile-push-specific — the rest is upstream code untouched. The tenant boundary enforcement lives entirely in Layers 2.5 (middleware) and 6 (plugin guard); upstream Hono and hot-updater handler are completely tenant-agnostic.
+Six layers, but only Layers 2 (Cache-Control headers), 2.5 (tenant middleware), 3 (in-memory cache), and 6 (plugin guard) are tile-push-specific. The rest is upstream code untouched. The tenant boundary enforcement lives entirely in Layers 2.5 and 6.
+
+**Bundle byte download path** is simpler — no Cloud Run involved:
+
+```
+[User device]
+   │  HTTPS GET https://ota.tile.dev/t/{appId}/{bundleId}/bundle.zip
+   ▼
+[LB + Cloud CDN]
+   │  URL map: default route → backend-bundles
+   │  Cache key: (host, path) — full path matches forever per bundle
+   │  ├─ HIT  → serve from edge (~5ms TTFB)
+   │  └─ MISS → cache fill from GCS bucket
+   ▼
+[GCS: tile-push-bundles/t/{appId}/{bundleId}/bundle.zip]
+   Cache-Control: public, max-age=31536000, immutable
+   (Cached at edge for 1 year, never revalidates)
+```
+
+Bundle bytes are content-addressed (UUIDv7 bundle IDs), so the URL never serves different bytes — immutable caching is safe.
 
 ## Data model
 
@@ -209,21 +270,23 @@ Deleting a tenant becomes a single `gsutil rm -r gs://tile-push-bundles/t/{appId
 
 ## Request flow: update check by fingerprint (v2, multi-tenant)
 
-A typical client request (CDN-cacheable, no per-device URL variables):
+A typical client request:
 ```
-GET /api/check-update/v2/t/{appId}/fingerprint/ios/abc123fingerprint/production/00000000-.../00000000-...
-                       │  │  │                  │       │              │           │            │
-                       │  │  │                  │       │              │           │            └─ current bundleId
-                       │  │  │                  │       │              │           └────────────── minBundleId
-                       │  │  │                  │       │              └────────────────────────── channel
-                       │  │  │                  │       └───────────────────────────────────────── fingerprint hash
-                       │  │  │                  └───────────────────────────────────────────────── platform
-                       │  │  └──────────────────────────────────────────────────────────────────── tenant ID (tk_*)
-                       │  └─────────────────────────────────────────────────────────────────────── tenant route segment
-                       └────────────────────────────────────────────────────────────────────────── v2 marker
+GET https://ota.tile.dev/api/check-update/v2/t/{appId}/fingerprint/ios/abc123fingerprint/production/00000000-.../00000000-...
+                                          │  │  │                  │       │              │           │            │
+                                          │  │  │                  │       │              │           │            └─ current bundleId
+                                          │  │  │                  │       │              │           └────────────── minBundleId
+                                          │  │  │                  │       │              └────────────────────────── channel
+                                          │  │  │                  │       └───────────────────────────────────────── fingerprint hash
+                                          │  │  │                  └───────────────────────────────────────────────── platform
+                                          │  │  └──────────────────────────────────────────────────────────────────── tenant ID (tk_*)
+                                          │  └─────────────────────────────────────────────────────────────────────── tenant route segment
+                                          └────────────────────────────────────────────────────────────────────────── v2 marker
 ```
 
 Cohort is NOT in the URL — it's sent as part of the device's local state. The response returns `eligibleNumericCohorts` per candidate, and the client picks. This is what makes the URL CDN-cacheable.
+
+The bundleId and minBundleId path segments are kept in the URL because the server's response varies by these (rollback ordering, force-update enforcement). Cache cardinality is naturally bounded — at steady state most devices in a tenant share the same currentBundleId, so ~3-5 hot cache keys per (tenant, platform, channel, fingerprint).
 
 Server flow (cache MISS path):
 1. Firebase Hosting CDN forwards to Cloud Function (cache MISS only — most are HIT)
@@ -308,15 +371,34 @@ Live function at https://tile-push-io7lmh2oqa-uc.a.run.app
 (Also accessible via https://us-central1-apptile-staging-setup.cloudfunctions.net/tile-push)
 ```
 
+## Cache-Control + invalidation
+
+| URL pattern | Cache-Control header | Set by | TTL at edge |
+|---|---|---|---|
+| `/api/check-update/*` | `public, max-age=60, s-maxage=2592000` | Cloud Run response (in [`index.ts`](../plugins/firebase/firebase/functions/index.ts)) | 30 days, invalidated per tenant on deploy |
+| `/api/cli/*` | `private, no-store` + `Vary: Authorization` | Cloud Run response | NEVER cached |
+| `/t/{appId}/{bundleId}/**` (bundle bytes) | `public, max-age=31536000, immutable` | GCS object metadata (set at upload via signed PUT URL) | 1 year, never revalidates |
+
+**Invalidation flow:** when a deploy completes, the CLI's POST to `/api/cli/t/{appId}/bundles` triggers (after the Firestore commit):
+
+```ts
+POST https://compute.googleapis.com/.../urlMaps/tile-push-lb/invalidateCache
+{ "path": "/api/check-update/v2/t/{appId}/*" }
+```
+
+Cloud CDN flushes every cache entry under that prefix across the global edge fleet (<60s typical). Devices on their next check-update request get the new bundle list.
+
+Bundle bytes never need invalidation — content-addressed paths mean each URL serves the same bytes forever, so they cache permanently.
+
 ## IAM model
 
 | Identity | Permissions | Purpose |
 |---|---|---|
-| `tile-push` Cloud Run service's runtime SA | Project Editor (default) | Reads/writes Firestore (`tile-push` DB), reads/writes Storage (`tile-push-bundles`) |
+| `tile-push` Cloud Run service's runtime SA (`1097788179850-compute@developer.gserviceaccount.com`) | Project Editor (default), Cloud Run Invoker | Reads/writes Firestore (`tile-push` DB), reads/writes Storage (`tile-push-bundles`), calls Cloud CDN `urlMaps.invalidateCache` API on each deploy |
 | `allUsers` (public) | `run.invoker` on the `tile-push` Cloud Run service | Lets the RN client hit the function without auth |
-| `allUsers` (public) | `storage.objectViewer` on `gs://tile-push-bundles` | Allows direct bundle downloads without signed URLs (skips signBlob bottleneck) |
-| Firebase Hosting service | (managed by Google) | Forwards requests to the Cloud Function via firebase.json rewrites |
-| Developer (you) | Project IAM permissions | Deploy via firebase CLI |
+| `allUsers` (public) | `storage.objectViewer` on `gs://tile-push-bundles` | Allows direct bundle downloads via CDN backend bucket without signed URLs |
+| Firebase Hosting service | (managed by Google) | Still routes `apptile-staging-setup.web.app/api/**` to Cloud Run as a fallback path |
+| Developer (you) | Project IAM permissions | Deploy via firebase CLI, manage LB via gcloud |
 
 **Note on public access:**
 - The function's `allUsers → run.invoker` makes update-check publicly callable. Tenant boundary is enforced inside the function (Layer 2.5 middleware + Layer 6 plugin).
@@ -353,10 +435,14 @@ See `LATENCY_ANALYSIS.md` for cost projections at higher scales (10M, 100M, 1B D
 
 ## What's NOT in this architecture yet (roadmap)
 
-1. **Multi-tenancy** — `appId` field exists but no queries filter by it. Tenant_id should come from URL path or API key.
-2. **Cloud CDN** — would absorb ~85%+ of update-check traffic, slashing function invocations
-3. **Cloudflare R2 for bundle storage** — would eliminate the egress bill
-4. **Cohort URL collapse optimization** — when no rollout is active, drop cohort from URLs; collapses 1000 cache entries into 1
-5. **Custom domain** (`ota.tile.dev` or similar) — requires Cloud CDN + LB setup
-6. **Per-tenant admin console** — fork of `@hot-updater/console`
-7. **Customer-facing SDK + CLI** — forks of `@hot-updater/react-native` and `hot-updater` CLI
+1. ~~**Multi-tenancy**~~ — ✅ DONE. `appId` enforced on every query, URL, storage upload, cache key. See [Hard rules in CLAUDE.md](./CLAUDE.md).
+2. ~~**Cloud CDN**~~ — ✅ DONE (2026-05-25). Cloud CDN behind LB fronts `ota.tile.dev`. 30d edge TTL, per-tenant invalidation on deploy. See [`GCP_INFRASTRUCTURE.md`](./GCP_INFRASTRUCTURE.md).
+3. ~~**Custom domain**~~ — ✅ DONE. `https://ota.tile.dev` is the production endpoint, DNS on AWS Route 53, SSL via Google-managed cert.
+4. ~~**Cohort URL collapse optimization**~~ — ✅ DONE. v2 endpoint moves cohort picking to client; URLs are now CDN-cacheable.
+5. ~~**Customer-facing SDK + CLI**~~ — ✅ DONE. `@tile-push/react-native` and `@tile-push/cli` ship; SDK default baseURL is `https://ota.tile.dev`.
+6. **Per-tenant admin console** — pending. Fork of `@hot-updater/console`, rebrand, wire to `/api/cli/*`. Repo: `tile-web`. See [`ROADMAP.md`](./ROADMAP.md).
+7. **npm publish** — pending. `@tile-push/cli` + `@tile-push/react-native` are workspace-only today.
+8. **Patch generation** — pending. Server should generate per-asset diffs so devices fetch only changed bytes.
+9. **Per-project credentials** — pending. `~/.tile-push/credentials.json` currently single-tenant; needs map keyed by `appId` for multi-project laptop workflows.
+10. **Cloudflare R2 + Workers + D1 migration** — post-demo. ~98% cost reduction at hyper-viral scale via free egress. See [`ROADMAP.md`](./ROADMAP.md).
+11. **iOS bare RN integration guide** — post-demo. Mirror of the Android guide in [`packages/tile-push-cli/INTEGRATION_BARE_RN_ANDROID.md`](../packages/tile-push-cli/INTEGRATION_BARE_RN_ANDROID.md).
